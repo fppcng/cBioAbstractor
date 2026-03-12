@@ -1,3 +1,4 @@
+from typing import Optional, List, Dict, Tuple
 """
 cbio_detector.py
 ================
@@ -119,7 +120,7 @@ HEURISTIC_SIGNATURES = {
 # Few-shot example loader
 # ---------------------------------------------------------------------------
 
-def load_few_shot_examples() -> list[dict]:
+def load_few_shot_examples() -> List[dict]:
     """
     Load all curator-provided input/output/type triples from FEW_SHOT_DIR.
     Returns a list of dicts:
@@ -159,18 +160,18 @@ def load_few_shot_examples() -> list[dict]:
 # Heuristic detector
 # ---------------------------------------------------------------------------
 
-def _normalize_cols(columns: list[str]) -> set[str]:
+def _normalize_cols(columns: List[str]) -> set[str]:
     return {c.strip().lower().replace(" ", "_").replace("-", "_") for c in columns}
 
 
-def _heuristic_detect(df: pd.DataFrame) -> tuple[str | None, float]:
+def _heuristic_detect(df: pd.DataFrame) -> Tuple[Optional[str], float]:
     """
     Returns (detected_type, confidence) using column-name heuristics.
     confidence is in [0.0, 1.0].
     """
     cols = _normalize_cols(df.columns.tolist())
 
-    scores: dict[str, float] = {}
+    scores: Dict[str, float] = {}
 
     for fmt, sig in HEURISTIC_SIGNATURES.items():
         # Score: fraction of keywords present
@@ -237,7 +238,7 @@ def _heuristic_detect(df: pd.DataFrame) -> tuple[str | None, float]:
 # LLM-powered detector (few-shot)
 # ---------------------------------------------------------------------------
 
-def _llm_detect(df: pd.DataFrame, examples: list[dict], api_key: str) -> tuple[str, float, str]:
+def _llm_detect(df: pd.DataFrame, examples: List[dict], api_key: str) -> Tuple[str, float, str]:
     """
     Use Claude to detect the file type with few-shot examples injected.
     Returns (detected_type, confidence, reasoning).
@@ -316,8 +317,8 @@ Respond with ONLY a JSON object in this exact format (no markdown, no extra text
 
 def detect_file_type(
     df: pd.DataFrame,
-    anthropic_api_key: str | None = None,
-    openai_api_key: str | None = None,
+    anthropic_api_key: Optional[str] = None,
+    openai_api_key: Optional[str] = None,
 ) -> dict:
     """
     Detect the cBioPortal format of a DataFrame.

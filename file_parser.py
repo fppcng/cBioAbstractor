@@ -1,3 +1,4 @@
+from typing import Optional, List, Dict, Tuple
 """
 file_parser.py
 ==============

@@ -1,424 +1,608 @@
-"""
-streamlit_app.py — SYNAPSE cBioPortal Transformer UI
-=====================================================
-Replaces the original streamlit_app.py with a full cBioPortal transformation
-workflow while keeping the original Literature Retrieval section.
-"""
-
-import io
-import json
-import zipfile
-
-import pandas as pd
-import requests
+import os
 import streamlit as st
+import requests
+import pandas as pd
+import time
 
-# ── Config ───────────────────────────────────────────────────────────────────
-API_URL = st.secrets.get("API_URL", "http://localhost:8000")
+API_URL = os.getenv("API_URL", "http://localhost:8000")
 
-CBIO_TYPE_LABELS = {
-    "clinical_patient":  "🧑‍⚕️  Clinical — Patient",
-    "clinical_sample":   "🧬  Clinical — Sample",
-    "mutation":          "🔬  Mutation Data (MAF)",
-    "cna_discrete":      "📊  Copy Number Alteration (Discrete)",
-    "expression":        "📈  mRNA Expression",
-    "structural_variant":"🔗  Structural Variant / Fusion",
-    "timeline":          "📅  Timeline",
-    "methylation":       "🧪  Methylation",
-}
+# Render free tier cold-starts can take 30-60 s.
+# These timeouts are intentionally generous.
+TIMEOUT_FAST   = 60    # simple pings / downloads
+TIMEOUT_NORMAL = 300   # file uploads + LLM calls
+TIMEOUT_LONG   = 600   # curation report (PDF + many Excel sheets + LLM)
 
-CONFIDENCE_COLOR = lambda c: "🟢" if c >= 0.8 else ("🟡" if c >= 0.5 else "🔴")
+
+def _wake_backend(placeholder):
+    """
+    Ping the API root until it responds (handles Render cold-start).
+    Shows a live status message in *placeholder* while waiting.
+    Returns True if the backend is up, False if it never responded.
+    """
+    for attempt in range(1, 13):          # up to ~60 s
+        try:
+            r = requests.get(API_URL + "/docs", timeout=10)
+            if r.status_code < 500:
+                placeholder.empty()
+                return True
+        except requests.exceptions.RequestException:
+            pass
+        placeholder.info(
+            f"⏳ Waking up the server… ({attempt * 5} s elapsed)  \n"
+            "The backend may be starting from sleep — this usually takes under 60 s."
+        )
+        time.sleep(5)
+    placeholder.error(
+        "❌ Backend did not respond after 60 s. "
+        "Check that the Render service is running."
+    )
+    return False
+
+
+# ─────────────────────────────────────────────────────────────
+# Helper: render a single code Q&A response
+# ─────────────────────────────────────────────────────────────
+
+def _render_qa_result(result: dict):
+    """Render a /code_query/ response dict in the chat."""
+    result_type = result.get("result_type", "text")
+    answer      = result.get("answer")
+    explanation = result.get("explanation", "")
+    code        = result.get("code", "")
+    error       = result.get("error")
+
+    # Answer
+    if result_type == "dataframe" and isinstance(answer, list) and answer:
+        st.dataframe(pd.DataFrame(answer), use_container_width=True, hide_index=True)
+    elif result_type == "dict" and isinstance(answer, dict):
+        for k, v in answer.items():
+            st.write(f"**{k}:** {v}")
+    elif result_type == "list" and isinstance(answer, list):
+        for item in answer:
+            st.write(f"- {item}")
+    else:
+        st.write(str(answer))
+
+    # Explanation
+    if explanation:
+        st.caption(explanation)
+
+    # Code expander
+    if code:
+        with st.expander("🔍  View generated code"):
+            st.code(code, language="python")
+
+    # Error display
+    if error:
+        with st.expander("⚠️  Execution error"):
+            st.code(error, language="text")
 
 st.set_page_config(
-    page_title="SYNAPSE · cBioPortal Transformer",
-    page_icon="⬡",
+    page_title="Synopsis — Literature & cBioPortal Curator",
+    page_icon="🧬",
     layout="wide",
 )
 
-# ── Custom CSS ────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Syne:wght@700;800&display=swap');
-[data-testid="stSidebar"] { background: #060e16; }
-.stButton > button {
-    background: linear-gradient(135deg,#00c896,#00a8ff);
-    color: #060e16; font-weight: 800; border: none; border-radius: 10px;
-}
-.block-container { padding-top: 1.5rem; }
-.detection-card {
-    background: #0a1420; border: 1px solid #0d3a2e; border-radius: 12px;
-    padding: 18px 24px; margin-bottom: 16px;
-}
-</style>
-""", unsafe_allow_html=True)
+st.title("🧬 Synopsis")
+st.caption(
+    "Literature Retrieval Evidence Summarization  ·  "
+    "cBioPortal Curation  ·  Gene Alteration Analysis"
+)
+
+tab_lit, tab_cbio, tab_gene = st.tabs([
+    "📚  Literature Retrieval",
+    "🗂️  cBioPortal Curator",
+    "🧪  Gene Alterations & Code Q&A",
+])
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR
-# ══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+# TAB 1 — Literature Retrieval  (unchanged)
+# ═══════════════════════════════════════════════════════════════════════
 
-with st.sidebar:
-    st.markdown("## ⬡ SYNAPSE")
-    st.markdown("**cBioPortal Data Transformer**")
-    st.divider()
-
-    nav = st.radio(
-        "Navigate",
-        ["🔄 Transform File", "🧠 Train AI (Save Examples)", "📚 Example Library", "🔬 Literature Retrieval"],
-        label_visibility="collapsed",
-    )
-    st.divider()
-    st.caption("Formats supported:")
-    for k, v in CBIO_TYPE_LABELS.items():
-        st.caption(f"  {v}")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE: TRANSFORM FILE
-# ══════════════════════════════════════════════════════════════════════════════
-
-if nav == "🔄 Transform File":
-    st.title("🔄 Transform Supplemental File → cBioPortal")
-    st.markdown(
-        "Upload **any** supplemental file (CSV, TSV, TXT, Excel). "
-        "The AI will **automatically detect** its type, then transform it into the "
-        "correct cBioPortal format with matching meta file."
-    )
-
-    # ── Upload ────────────────────────────────────────────────────────────────
-    uploaded = st.file_uploader(
-        "Drop supplemental file here",
-        type=["csv", "tsv", "txt", "tab", "xlsx", "xls"],
-        help="Any clinical or genomic supplemental file from Synapse, REDCap, GENIE, etc.",
-    )
-
-    if uploaded:
-        raw_bytes = uploaded.read()
-        uploaded.seek(0)
-
-        st.success(f"📄 **{uploaded.name}** · {len(raw_bytes)/1024:.1f} KB")
-
-        # Quick preview
-        try:
-            text = raw_bytes.decode("utf-8", errors="replace")
-            lines = text.splitlines()
-            preview_lines = [l for l in lines[:12] if not l.startswith("#")]
-            st.code("\n".join(preview_lines[:8]), language="text")
-        except Exception:
-            pass
-
-        st.divider()
-
-        # ── Detection ─────────────────────────────────────────────────────────
-        col1, col2 = st.columns([2, 1])
-
-        with col1:
-            st.subheader("Step 1 — File Type Detection")
-            detect_clicked = st.button("🔍 Auto-Detect File Type", use_container_width=True)
-
-        if detect_clicked or "detection_result" in st.session_state:
-            if detect_clicked:
-                with st.spinner("Analyzing file structure…"):
-                    resp = requests.post(
-                        f"{API_URL}/detect/",
-                        files={"input_file": (uploaded.name, raw_bytes, "application/octet-stream")},
-                        timeout=60,
-                    )
-                if resp.status_code == 200:
-                    st.session_state["detection_result"] = resp.json()
-                    st.session_state["uploaded_name"] = uploaded.name
-                    st.session_state["uploaded_bytes"] = raw_bytes
-                else:
-                    st.error(f"Detection failed: {resp.text}")
-
-            dr = st.session_state.get("detection_result", {})
-            if dr:
-                conf = dr.get("confidence", 0)
-                dtype = dr.get("type", "")
-
-                st.markdown(f"""
-<div class="detection-card">
-<b>Detected Type:</b> {CBIO_TYPE_LABELS.get(dtype, dtype)}<br>
-<b>Confidence:</b> {CONFIDENCE_COLOR(conf)} {conf:.0%}  &nbsp;&nbsp;
-<b>Method:</b> {dr.get('method','')}<br>
-<b>Reasoning:</b> <i>{dr.get('reasoning','')}</i><br>
-<b>Input:</b> {dr.get('row_count','')} rows × {len(dr.get('columns',[]))} columns
-</div>
-""", unsafe_allow_html=True)
-
-                if dr.get("column_mappings"):
-                    with st.expander("Suggested column mappings"):
-                        st.json(dr["column_mappings"])
-
-                if dr.get("low_confidence"):
-                    st.warning("⚠️ Low confidence — please verify or override the detected type below.")
-
-        # ── Configuration ─────────────────────────────────────────────────────
-        st.subheader("Step 2 — Configure")
-
-        dr = st.session_state.get("detection_result", {})
-        detected_type = dr.get("type", "clinical_sample")
-
-        type_options = list(CBIO_TYPE_LABELS.keys())
-        default_idx = type_options.index(detected_type) if detected_type in type_options else 0
-
-        selected_type = st.selectbox(
-            "Target cBioPortal format",
-            options=type_options,
-            index=default_idx,
-            format_func=lambda x: CBIO_TYPE_LABELS[x],
+with tab_lit:
+    with st.sidebar:
+        st.title("Vector Store — PDF Loader")
+        uploaded_files = st.file_uploader(
+            "Choose PDF files", accept_multiple_files=True, type="pdf"
         )
-
-        col_a, col_b = st.columns(2)
-        with col_a:
-            study_id = st.text_input(
-                "Cancer Study Identifier",
-                value="my_study_2025",
-                help="e.g. brca_tcga_2024",
-            ).strip().lower().replace(" ", "_")
-        with col_b:
-            curator_notes = st.text_area(
-                "Curator Notes (optional)",
-                placeholder="e.g. 'survival column is in days, not months'\n'map column X to PATIENT_ID'",
-                height=80,
-            )
-
-        # ── Transform ─────────────────────────────────────────────────────────
-        st.subheader("Step 3 — Transform")
-
-        transform_clicked = st.button("⚡ Transform to cBioPortal Format", use_container_width=True, type="primary")
-
-        if transform_clicked:
-            use_bytes = st.session_state.get("uploaded_bytes", raw_bytes)
-            use_name = st.session_state.get("uploaded_name", uploaded.name)
-
-            with st.spinner(f"Transforming to {CBIO_TYPE_LABELS[selected_type]}…"):
-                resp = requests.post(
-                    f"{API_URL}/transform/",
-                    files={"input_file": (use_name, use_bytes, "application/octet-stream")},
-                    data={
-                        "cbio_type": selected_type,
-                        "study_id": study_id,
-                        "curator_notes": curator_notes,
-                        "auto_detect": "false",
-                    },
-                    timeout=120,
-                )
-
-            if resp.status_code == 200:
-                result = resp.json()
-                st.session_state["transform_result"] = result
-                st.success("✅ Transformation complete!")
-            else:
-                st.error(f"Transform failed: {resp.text}")
-
-        # ── Results ───────────────────────────────────────────────────────────
-        if "transform_result" in st.session_state:
-            result = st.session_state["transform_result"]
-            summary = result.get("summary", {})
-
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Input Rows", summary.get("input_rows", "—"))
-            m2.metric("Input Cols", summary.get("input_cols", "—"))
-            m3.metric("Output Rows", summary.get("output_rows", "—"))
-            m4.metric("Output Cols", summary.get("output_cols", "—"))
-
-            tab_data, tab_meta, tab_train = st.tabs(
-                [f"📄 {result['data_filename']}", f"⚙️ {result['meta_filename']}", "🧠 Save as Training Example"]
-            )
-
-            with tab_data:
-                st.code(result["data_content"], language="text")
-                st.download_button(
-                    f"⬇ Download {result['data_filename']}",
-                    data=result["data_content"],
-                    file_name=result["data_filename"],
-                    mime="text/plain",
-                    use_container_width=True,
-                )
-
-            with tab_meta:
-                st.code(result["meta_content"], language="text")
-                st.download_button(
-                    f"⬇ Download {result['meta_filename']}",
-                    data=result["meta_content"],
-                    file_name=result["meta_filename"],
-                    mime="text/plain",
-                    use_container_width=True,
-                )
-
-            # Download both as ZIP
-            zip_buf = io.BytesIO()
-            with zipfile.ZipFile(zip_buf, "w") as zf:
-                zf.writestr(result["data_filename"], result["data_content"])
-                zf.writestr(result["meta_filename"], result["meta_content"])
-            zip_buf.seek(0)
-            st.download_button(
-                "⬇ Download Both Files (ZIP)",
-                data=zip_buf,
-                file_name=f"{study_id}_cbio_files.zip",
-                mime="application/zip",
-                use_container_width=True,
-            )
-
-            with tab_train:
-                st.markdown("""
-**Is this output correct?**
-If you edit the output above and want the AI to learn from this example,
-paste the corrected TSV below and click **Save as Training Example**.
-""")
-                corrected = st.text_area(
-                    "Corrected cBioPortal output (paste edited version)",
-                    value=result["data_content"],
-                    height=300,
-                    key="corrected_output",
-                )
-                train_desc = st.text_input("Description (optional)", placeholder="e.g. REDCap clinical patient file with days→months conversion")
-
-                if st.button("💾 Save as Training Example"):
-                    use_bytes = st.session_state.get("uploaded_bytes", raw_bytes)
-                    use_name = st.session_state.get("uploaded_name", uploaded.name)
-                    save_resp = requests.post(
-                        f"{API_URL}/save_example/",
-                        files={
-                            "input_file": (use_name, use_bytes, "application/octet-stream"),
-                            "output_file": ("output.tsv", corrected.encode(), "text/plain"),
-                        },
-                        data={"cbio_type": selected_type, "description": train_desc},
-                        timeout=30,
-                    )
-                    if save_resp.status_code == 200:
-                        st.success(f"✅ {save_resp.json()['message']}")
-                    else:
-                        st.error(f"Save failed: {save_resp.text}")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE: TRAIN AI
-# ══════════════════════════════════════════════════════════════════════════════
-
-elif nav == "🧠 Train AI (Save Examples)":
-    st.title("🧠 Train the AI — Add Few-Shot Examples")
-    st.markdown("""
-The AI learns from **curator-validated example pairs**.
-Each example teaches it how to handle a specific file pattern.
-
-**How it works:**
-1. Upload an input file (any supplemental file)
-2. Upload the correct cBioPortal output for that file
-3. Label the type — the AI will use this example immediately in future calls, no restart needed.
-""")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        train_input = st.file_uploader("Input file (raw supplemental)", key="train_input")
-    with col2:
-        train_output = st.file_uploader("Correct cBioPortal output (TSV)", key="train_output")
-
-    train_type = st.selectbox(
-        "cBioPortal type of this example",
-        options=list(CBIO_TYPE_LABELS.keys()),
-        format_func=lambda x: CBIO_TYPE_LABELS[x],
-        key="train_type",
-    )
-    train_desc = st.text_input("Description (what does this example teach?)", key="train_desc")
-
-    if st.button("💾 Save Training Example", type="primary") and train_input and train_output:
-        resp = requests.post(
-            f"{API_URL}/save_example/",
-            files={
-                "input_file": (train_input.name, train_input.read(), "application/octet-stream"),
-                "output_file": (train_output.name, train_output.read(), "text/plain"),
-            },
-            data={"cbio_type": train_type, "description": train_desc},
-            timeout=30,
-        )
-        if resp.status_code == 200:
-            d = resp.json()
-            st.success(f"✅ Saved example **{d['example_id']}** for `{d['cbio_type']}`. "
-                       "The AI will use this in all future calls.")
-        else:
-            st.error(f"Failed: {resp.text}")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE: EXAMPLE LIBRARY
-# ══════════════════════════════════════════════════════════════════════════════
-
-elif nav == "📚 Example Library":
-    st.title("📚 Few-Shot Training Example Library")
-    st.markdown("All curator-saved examples the AI is currently learning from.")
-
-    resp = requests.get(f"{API_URL}/examples/", timeout=10)
-    if resp.status_code == 200:
-        examples = resp.json().get("examples", [])
-        if not examples:
-            st.info("No examples saved yet. Go to **Train AI** to add your first example.")
-        else:
-            st.metric("Total Examples", len(examples))
-            # Group by type
-            by_type: dict[str, list] = {}
-            for ex in examples:
-                by_type.setdefault(ex["type"], []).append(ex)
-
-            for t, exs in by_type.items():
-                with st.expander(f"{CBIO_TYPE_LABELS.get(t, t)}  ·  {len(exs)} example(s)"):
-                    for ex in exs:
-                        c1, c2, c3 = st.columns([1, 3, 1])
-                        c1.code(ex["id"])
-                        c2.write(ex.get("description") or "_no description_")
-                        c3.caption(ex.get("created_at", "")[:10])
-                        if c3.button("🗑 Delete", key=f"del_{ex['id']}"):
-                            del_resp = requests.delete(f"{API_URL}/examples/{ex['id']}", timeout=10)
-                            if del_resp.status_code == 200:
-                                st.success(f"Deleted {ex['id']}")
-                                st.rerun()
-    else:
-        st.error("Could not reach API.")
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# PAGE: ORIGINAL LITERATURE RETRIEVAL
-# ══════════════════════════════════════════════════════════════════════════════
-
-elif nav == "🔬 Literature Retrieval":
-    st.title("🔬 Literature Retrieval Evidence Summarization")
-    st.markdown("_Original SYNAPSE functionality — preserved unchanged._")
-
-    with st.expander("📥 Vector Store Management", expanded=False):
-        uploaded_pdfs = st.file_uploader(
-            "Upload PDF files", accept_multiple_files=True, type="pdf"
-        )
-        if st.button("Load PDFs"):
-            if uploaded_pdfs:
-                for pdf in uploaded_pdfs:
-                    resp = requests.post(
+        if st.button("Load PDFs", key="load_pdfs_button"):
+            if uploaded_files:
+                for uploaded_file in uploaded_files:
+                    response = requests.post(
                         f"{API_URL}/ingest_pdf/",
-                        files={"file": (pdf.name, pdf.getvalue())},
+                        files={"file": (uploaded_file.name, uploaded_file.getvalue())},
                     )
-                    if resp.status_code == 200:
-                        st.success(f"✅ {pdf.name} ingested.")
+                    if response.status_code == 200:
+                        st.success(f"✅ {uploaded_file.name} ingested.")
                     else:
-                        st.error(f"❌ {pdf.name} failed: {resp.text}")
+                        st.error(f"❌ Error processing {uploaded_file.name}.")
+                st.success("Done")
             else:
-                st.warning("Upload PDF files first.")
+                st.warning("Please upload at least one PDF.")
 
-        if st.button("🗑 Clear Vector Store"):
-            resp = requests.post(f"{API_URL}/clear_vector_store/")
-            if resp.status_code == 200:
+        if st.button("Clear Vector Store", key="clear_vector_store_button"):
+            response = requests.post(f"{API_URL}/clear_vector_store/")
+            if response.status_code == 200:
                 st.success("Vector store cleared.")
             else:
-                st.error("Clear failed.")
+                st.error("Error clearing vector store.")
 
-    question = st.text_input("Provide the parameters to generate evidence-based answers")
+    st.subheader("Ask a question")
+    question = st.text_input("Provide parameters to generate evidence-based answers")
     if st.button("Get Answer"):
         if question:
-            with st.spinner("Processing…"):
-                resp = requests.post(f"{API_URL}/generate_evidence/", data={"question": question})
-                if resp.status_code == 200:
+            with st.spinner("Searching vector store and generating answer…"):
+                response = requests.post(
+                    f"{API_URL}/generate_evidence/", data={"question": question}
+                )
+                if response.status_code == 200:
+                    data = response.json()
                     st.write("**Answer:**")
-                    st.write(resp.json()["answer"])
+                    st.write(data.get("answer", "No answer returned."))
                 else:
                     st.error("Error fetching answer.")
         else:
             st.warning("Please enter a question.")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# TAB 2 — cBioPortal Curator  (unchanged)
+# ═══════════════════════════════════════════════════════════════════════
+
+with tab_cbio:
+    st.subheader("cBioPortal Data Curation Report Generator")
+    st.markdown(
+        """
+        Upload the **main paper PDF** and any **supplementary files** from a
+        cancer genomics study.
+        The tool will:
+        - Extract study metadata (cancer type, cohort size, reference genome, PMID…)
+        - Classify every supplementary sheet against cBioPortal file formats
+        - Build column-mapping & transformation instructions
+        - Generate a downloadable **.docx** curation report
+        """
+    )
+
+    # Spec status indicator
+    try:
+        spec_info = requests.get(f"{API_URL}/spec_status", timeout=10)
+        if spec_info.status_code == 200:
+            si = spec_info.json()
+            if si.get("source") == "live":
+                st.success(
+                    f"✅ Format spec: **live** from docs.cbioportal.org  "
+                    f"({si.get('num_formats', '?')} formats)  "
+                    f"— fetched {si.get('fetched_at','?')[:19].replace('T',' ')} UTC"
+                )
+            else:
+                st.warning(
+                    "⚠️ Format spec: **embedded fallback** "
+                    f"(live fetch unavailable: {si.get('error','')})"
+                )
+    except Exception:
+        pass   # Silently skip if backend is cold
+
+    st.divider()
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.markdown("#### 1.  Upload Paper PDF")
+        paper_pdf = st.file_uploader("Main paper (PDF)", type=["pdf"], key="cbio_paper_pdf")
+
+    with col2:
+        st.markdown("#### 2.  Upload Supplementary Files")
+        supp_files = st.file_uploader(
+            "Supplementary data files (.xlsx, .csv, .tsv, .txt, .maf, .docx, .pdf)",
+            type=["xlsx", "xls", "csv", "tsv", "txt", "tab", "maf", "doc", "docx", "pdf"],
+            accept_multiple_files=True,
+            key="cbio_supp_files",
+        )
+
+    st.divider()
+
+    with st.expander("⚙️  Advanced Options"):
+        llm_model = st.selectbox(
+            "LLM for metadata extraction",
+            options=[
+                "openai/gpt-4o",
+                "openai/gpt-4-turbo",
+                "openai/gpt-3.5-turbo",
+                "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0",
+                "bedrock/anthropic.claude-3-5-sonnet-20240620-v1:0",
+            ],
+        )
+        temperature = st.slider("LLM temperature", 0.0, 1.0, 0.2, 0.05)
+
+    if st.button("🚀  Generate cBioPortal Curation Report",
+                 disabled=(paper_pdf is None), type="primary"):
+        wake_ph = st.empty()
+        if not _wake_backend(wake_ph):
+            st.stop()
+
+        with st.spinner("Analysing paper and supplementary files… (may take 1–3 min)"):
+            files_payload = [
+                ("paper_pdf", (paper_pdf.name, paper_pdf.getvalue(), "application/pdf"))
+            ]
+            for sf in (supp_files or []):
+                files_payload.append((
+                    "supplementary_files",
+                    (sf.name, sf.getvalue(),
+                     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+                ))
+            try:
+                resp = requests.post(
+                    f"{API_URL}/curate_cbioportal/",
+                    files=files_payload,
+                    data={"llm_model": llm_model, "temperature": str(temperature)},
+                    timeout=TIMEOUT_LONG,
+                )
+            except requests.exceptions.Timeout:
+                st.error(
+                    "⏱️ Request timed out after 10 min. "
+                    "Try uploading fewer supplementary files, or check the server logs."
+                )
+                st.stop()
+            except requests.exceptions.ConnectionError as e:
+                st.error(f"🔌 Connection error: {e}")
+                st.stop()
+
+        if resp.status_code == 200:
+            result = resp.json()
+            st.success("✅ Curation report generated!")
+            st.divider()
+
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Study ID",        result.get("study_id", "—"))
+            m2.metric("Cancer Type",     result.get("cancer_type", "—"))
+            m3.metric("Samples",         result.get("num_samples", "—"))
+            m4.metric("Files Analysed",  result.get("files_analysed", "—"))
+            m5.metric("Sheets Analysed", result.get("sheets_analysed", "—"))
+
+            p1, p2, p3 = st.columns(3)
+            p1.metric("🔴 High Priority",   result.get("high_priority", 0))
+            p2.metric("🟡 Medium Priority", result.get("medium_priority", 0))
+            p3.metric("⬜ Not Loadable",     result.get("not_loadable", 0))
+
+            st.divider()
+            st.markdown("### Supplementary File Breakdown")
+            breakdown = result.get("file_breakdown", [])
+            if breakdown:
+                def _style_cur(val):
+                    c = {"YES": "#E2EFDA;color:#375623",
+                         "PARTIAL": "#FFF2CC;color:#7F6000",
+                         "NO": "#FCE4D6;color:#843C0C"}
+                    return f"background-color:{c[val]}" if val in c else ""
+
+                def _style_pri(val):
+                    c = {"HIGH": "#FCE4D6;color:#843C0C",
+                         "MEDIUM": "#FFF2CC;color:#7F6000",
+                         "LOW": "#E2EFDA;color:#375623",
+                         "N/A": "#F2F2F2;color:#595959"}
+                    return f"background-color:{c[val]}" if val in c else ""
+
+                def _style_conf(val):
+                    try:
+                        v = float(str(val).replace("%", ""))
+                        if v >= 70: return "background-color:#E2EFDA;color:#375623"
+                        if v >= 40: return "background-color:#FFF2CC;color:#7F6000"
+                        return "background-color:#FCE4D6;color:#843C0C"
+                    except Exception:
+                        return ""
+
+                df_bd = pd.DataFrame([{
+                    "File":              row["file"],
+                    "Sheet":             row["sheet"],
+                    "cBioPortal Format": row["cbio_format"],
+                    "Confidence":        f"{row.get('confidence', 0):.0f}%",
+                    "Curate?":           row["curability"],
+                    "Priority":          row["priority"],
+                    "Required ✓":        ", ".join(row.get("req_present", [])) or "—",
+                    "Required ✗":        ", ".join(row.get("req_missing", [])) or "none",
+                } for row in breakdown])
+
+                styled = (df_bd.style
+                          .applymap(_style_cur,  subset=["Curate?"])
+                          .applymap(_style_pri,  subset=["Priority"])
+                          .applymap(_style_conf, subset=["Confidence"]))
+                st.dataframe(styled, use_container_width=True, hide_index=True)
+
+                with st.expander("🔍  Classification verdicts (per sheet)"):
+                    for row in breakdown:
+                        st.markdown(
+                            f"**{row['file']} — {row['sheet']}**  \n"
+                            f"{row.get('verdict', '')}"
+                        )
+                        if row.get("req_missing"):
+                            st.caption(
+                                "⚠️ Missing required: "
+                                + ", ".join(row["req_missing"])
+                            )
+
+            st.divider()
+            dl_url = result.get("report_download_url")
+            if dl_url:
+                dl = requests.get(f"{API_URL}{dl_url}", timeout=TIMEOUT_FAST)
+                if dl.status_code == 200:
+                    st.download_button(
+                        "📥  Download cBioPortal Curation Report (.docx)",
+                        data=dl.content,
+                        file_name=result.get("report_filename",
+                                             "cbioportal_curation_report.docx"),
+                        mime=("application/vnd.openxmlformats-officedocument"
+                              ".wordprocessingml.document"),
+                        type="primary",
+                    )
+        else:
+            st.error(f"API error ({resp.status_code}): {resp.text[:400]}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# TAB 3 — Gene Alteration Analysis + Code Q&A  (new)
+# ═══════════════════════════════════════════════════════════════════════
+
+with tab_gene:
+    st.subheader("Gene Alteration Frequencies & Code Q&A")
+    st.markdown(
+        """
+        Upload a **MAF, Excel, or CSV** genomic data file to:
+        - Compute per-gene **mutation, amplification, deletion, SV, and combined**
+          alteration frequencies (% samples altered)
+        - Ask free-text questions about the data — the tool writes and runs Python
+          code to answer them
+        """
+    )
+
+    st.divider()
+
+    # ── 1. File upload & frequency computation ──────────────────────────
+    st.markdown("#### 1.  Upload Genomic Data File")
+    st.caption(
+        "Accepted formats: MAF (.maf / .txt / .tsv), Excel (.xlsx), CSV (.csv).  "
+        "Automatically detects mutations, CNA matrices, and SV/fusion tables."
+    )
+    gene_file = st.file_uploader(
+        "Choose file",
+        type=["maf", "txt", "tsv", "csv", "xlsx"],
+        key="gene_data_file",
+    )
+
+    if "gene_session_id" not in st.session_state:
+        st.session_state["gene_session_id"] = None
+    if "gene_freq_df" not in st.session_state:
+        st.session_state["gene_freq_df"] = None
+    if "gene_summary" not in st.session_state:
+        st.session_state["gene_summary"] = None
+    if "code_qa_history" not in st.session_state:
+        st.session_state["code_qa_history"] = []
+
+    load_btn = st.button(
+        "📊  Compute Alteration Frequencies",
+        disabled=(gene_file is None),
+        type="primary",
+    )
+
+    if load_btn and gene_file:
+        wake_ph = st.empty()
+        if not _wake_backend(wake_ph):
+            st.stop()
+
+        with st.spinner("Parsing file and computing frequencies…"):
+            try:
+                resp = requests.post(
+                    f"{API_URL}/gene_alterations/",
+                    files={"data_file": (gene_file.name, gene_file.getvalue())},
+                    timeout=TIMEOUT_NORMAL,
+                )
+            except requests.exceptions.Timeout:
+                st.error(
+                    "⏱️ Request timed out after 5 min. "
+                    "The file may be very large — try a smaller subset."
+                )
+                st.stop()
+            except requests.exceptions.ConnectionError as e:
+                st.error(f"🔌 Connection error: {e}")
+                st.stop()
+        if resp.status_code == 200:
+            payload = resp.json()
+            st.session_state["gene_session_id"] = payload["session_id"]
+            st.session_state["gene_summary"]    = payload["summary"]
+            st.session_state["code_qa_history"] = []  # reset chat on new file
+            freq_records = payload.get("frequencies", [])
+            if freq_records:
+                st.session_state["gene_freq_df"] = pd.DataFrame(freq_records)
+            else:
+                st.session_state["gene_freq_df"] = pd.DataFrame()
+            st.success("✅ File loaded successfully!")
+        else:
+            st.error(f"Error ({resp.status_code}): {resp.text[:400]}")
+
+    # ── 2. Summary metrics & visualisation ─────────────────────────────
+    if st.session_state["gene_summary"]:
+        summ = st.session_state["gene_summary"]
+        st.divider()
+        st.markdown("### Dataset Summary")
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Samples",   summ.get("n_samples", "—"))
+        c2.metric("Genes",     summ.get("n_genes",   "—"))
+        c3.metric("Mutations", "✓" if summ.get("has_mutations") else "—")
+        c4.metric("CNA",       "✓" if summ.get("has_cna")       else "—")
+        c5.metric("SV/Fusion", "✓" if summ.get("has_sv")        else "—")
+
+        freq_df: pd.DataFrame = st.session_state["gene_freq_df"]
+
+        if freq_df is not None and not freq_df.empty:
+            st.divider()
+
+            # ── Controls row ──────────────────────────────────────────
+            ctrl1, ctrl2, ctrl3 = st.columns([2, 2, 2])
+            with ctrl1:
+                top_n = st.slider("Top N genes to display", 5, 50, 20, 5,
+                                  key="top_n_slider")
+            with ctrl2:
+                sort_col = st.selectbox(
+                    "Sort by",
+                    ["pct_any", "pct_mutated", "pct_amp", "pct_del", "pct_sv"],
+                    key="sort_col_select",
+                )
+            with ctrl3:
+                chart_type = st.selectbox(
+                    "Chart type",
+                    ["Stacked bar", "Side-by-side bar", "Table only"],
+                    key="chart_type_select",
+                )
+
+            # Prepare display slice
+            gene_col = "gene" if "gene" in freq_df.columns else freq_df.columns[0]
+            display_df = (
+                freq_df.sort_values(sort_col, ascending=False)
+                       .head(top_n)
+            )
+
+            # ── Chart ─────────────────────────────────────────────────
+            if chart_type != "Table only":
+                try:
+                    import plotly.graph_objects as go
+
+                    genes    = display_df[gene_col].tolist()
+                    mut_vals = display_df.get("pct_mutated",
+                               pd.Series([0]*len(genes))).fillna(0).tolist()
+                    amp_vals = display_df.get("pct_amp",
+                               pd.Series([0]*len(genes))).fillna(0).tolist()
+                    del_vals = display_df.get("pct_del",
+                               pd.Series([0]*len(genes))).fillna(0).tolist()
+                    sv_vals  = display_df.get("pct_sv",
+                               pd.Series([0]*len(genes))).fillna(0).tolist()
+
+                    bar_mode = "stack" if chart_type == "Stacked bar" else "group"
+                    colour   = {
+                        "Mutation":      "#E05C5C",
+                        "Amplification": "#F5A623",
+                        "Deletion":      "#4A90D9",
+                        "SV/Fusion":     "#7ED321",
+                    }
+
+                    fig = go.Figure()
+                    for label, vals, col in [
+                        ("Mutation",      mut_vals, colour["Mutation"]),
+                        ("Amplification", amp_vals, colour["Amplification"]),
+                        ("Deletion",      del_vals, colour["Deletion"]),
+                        ("SV/Fusion",     sv_vals,  colour["SV/Fusion"]),
+                    ]:
+                        if any(v > 0 for v in vals):
+                            fig.add_trace(go.Bar(
+                                name=label, x=genes, y=vals,
+                                marker_color=col,
+                                hovertemplate="%{x}<br>"
+                                              + label + ": %{y:.1f}%<extra></extra>",
+                            ))
+
+                    fig.update_layout(
+                        barmode=bar_mode,
+                        xaxis_title="Gene",
+                        yaxis_title="% Samples Altered",
+                        yaxis=dict(range=[0, 100]),
+                        legend=dict(orientation="h", yanchor="bottom",
+                                    y=1.02, xanchor="right", x=1),
+                        height=420,
+                        margin=dict(t=40, b=60),
+                        plot_bgcolor="white",
+                        paper_bgcolor="white",
+                    )
+                    fig.update_xaxes(tickangle=-45)
+                    st.plotly_chart(fig, use_container_width=True)
+
+                except ImportError:
+                    st.warning(
+                        "plotly not installed — showing table only. "
+                        "Add `plotly` to requirements.txt for charts."
+                    )
+
+            # ── Sortable table ────────────────────────────────────────
+            st.markdown("##### Alteration Frequency Table")
+
+            # Colour pct_any column: ≥20% red, 5-20% amber, <5% green
+            def _colour_pct(val):
+                try:
+                    v = float(val)
+                    if v >= 20:  return "background-color:#FCE4D6;color:#843C0C"
+                    if v >= 5:   return "background-color:#FFF2CC;color:#7F6000"
+                    return "background-color:#E2EFDA;color:#375623"
+                except Exception:
+                    return ""
+
+            pct_cols = [c for c in display_df.columns if c.startswith("pct_")]
+            tbl_styled = display_df.style.applymap(_colour_pct, subset=pct_cols)
+            st.dataframe(tbl_styled, use_container_width=True, hide_index=True)
+
+    # ── 3. Code Q&A chat ───────────────────────────────────────────────
+    if st.session_state["gene_session_id"]:
+        st.divider()
+        st.markdown("### 💬  Ask a Question About the Data")
+        st.caption(
+            "The tool writes and runs Python code against your dataset to answer "
+            "your question. Examples:\n"
+            "- *Which genes are mutated in >10% of samples?*\n"
+            "- *What is the median VAF for KIT mutations?*\n"
+            "- *How many samples have both a KIT mutation and a chromosome 14 deletion?*\n"
+            "- *Show the top 5 co-occurring gene pairs.*"
+        )
+
+        with st.expander("⚙️  Code Q&A Options"):
+            qa_model = st.selectbox(
+                "LLM model",
+                ["openai/gpt-4o", "openai/gpt-4-turbo",
+                 "bedrock/anthropic.claude-3-5-sonnet-20241022-v2:0"],
+                key="qa_model_select",
+            )
+            qa_temp = st.slider("Temperature", 0.0, 1.0, 0.2, 0.05,
+                                key="qa_temp_slider")
+
+        # Render previous Q&A history
+        for entry in st.session_state["code_qa_history"]:
+            with st.chat_message("user"):
+                st.write(entry["question"])
+            with st.chat_message("assistant"):
+                _render_qa_result(entry["result"])
+
+        # New question input
+        user_q = st.chat_input("Ask a question about the alteration data…")
+
+        if user_q:
+            with st.chat_message("user"):
+                st.write(user_q)
+
+            with st.chat_message("assistant"):
+                with st.spinner("Generating and running code…"):
+                    try:
+                        qa_resp = requests.post(
+                            f"{API_URL}/code_query/",
+                            data={
+                                "session_id": st.session_state["gene_session_id"],
+                                "question":   user_q,
+                                "llm_model":  qa_model,
+                                "temperature": str(qa_temp),
+                            },
+                            timeout=TIMEOUT_NORMAL,
+                        )
+                    except requests.exceptions.Timeout:
+                        st.error(
+                            "⏱️ Request timed out after 5 min. "
+                            "Try a simpler question or reload the data file."
+                        )
+                        st.stop()
+                    except requests.exceptions.ConnectionError as e:
+                        st.error(f"🔌 Connection error: {e}")
+                        st.stop()
+
+                if qa_resp.status_code == 200:
+                    qa_result = qa_resp.json()
+                    _render_qa_result(qa_result)
+                    st.session_state["code_qa_history"].append({
+                        "question": user_q,
+                        "result":   qa_result,
+                    })
+                else:
+                    st.error(f"Error ({qa_resp.status_code}): {qa_resp.text[:300]}")
+

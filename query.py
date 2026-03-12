@@ -1,47 +1,26 @@
-"""
-query.py — Enhanced FastAPI backend for SYNAPSE cBioPortal Transformer
-=======================================================================
-Extends the original Literature Retrieval app with:
-
-  POST /detect/        — detect cBioPortal file type (heuristic + LLM few-shot)
-  POST /transform/     — transform supplemental file → cBioPortal format
-  POST /save_example/  — save a curator-corrected example for few-shot learning
-  GET  /examples/      — list all saved few-shot examples
-  DELETE /examples/{id}— remove an example
-  POST /summarize/     — original endpoint (preserved)
-
-All original endpoints are preserved unchanged.
-"""
-
-import os
-import io
-import json
-import tempfile
-import logging
-
-import pandas as pd
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, FileResponse
+import os
+import tempfile
+import urllib.parse
+from typing import List
 
-from file_parser import parse_file, get_raw_text
-from cbio_detector import detect_file_type
-from cbio_transformer import transform_to_cbio, META_TEMPLATES, DATA_FILENAMES, META_FILENAMES
-from few_shot_manager import save_example, list_examples, delete_example
 from system_prompt_config import load_system_prompt
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from cbioportal_curator import curate
+from gene_alteration_analyst import (
+    load_alteration_data,
+    compute_frequencies,
+    answer_question,
+)
 
 app = FastAPI(
-    title="SYNAPSE — cBioPortal Data Transformer",
+    title="Synopsis — Literature Retrieval, cBioPortal Curation & Gene Alteration Analysis",
     description=(
-        "Upload any supplemental file. The AI auto-detects whether it is a "
-        "clinical patient, clinical sample, mutation, CNA, expression, SV, "
-        "timeline, or methylation file — then transforms it into the correct "
-        "cBioPortal format. Curators can save examples to continuously improve accuracy."
+        "Upload papers, supplementary files, and genomic data tables to generate "
+        "evidence summaries, cBioPortal curation reports, and gene alteration analyses."
     ),
-    version="2.0.0",
+    version="3.0.0",
 )
 
 app.add_middleware(
@@ -52,212 +31,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+# ─────────────────────────────────────────────────────────────
+# In-memory caches (keyed by filename)
+# ─────────────────────────────────────────────────────────────
+
+_REPORT_CACHE: dict[str, str] = {}          # report filename → abs path
+_ALTERATION_CACHE: dict[str, object] = {}   # session_id → {data, freq}
 
 
-# ---------------------------------------------------------------------------
-# Helper
-# ---------------------------------------------------------------------------
-
-def _get_df_and_raw(file: UploadFile) -> tuple[pd.DataFrame, bytes]:
-    raw = file.file.read()
-    file.file.seek(0)
-    df = parse_file(raw, file.filename)
-    return df, raw
-
-
-# ---------------------------------------------------------------------------
-# NEW: Detect endpoint
-# ---------------------------------------------------------------------------
+# ═════════════════════════════════════════════════════════════
+# TAG: Literature Retrieval  (unchanged)
+# ═════════════════════════════════════════════════════════════
 
 @app.post(
-    "/detect/",
-    summary="Auto-detect cBioPortal file type",
-    response_description="Detection result with type, confidence, reasoning, and suggested column mappings",
+    "/summarize/",
+    summary="Summarise an uploaded file using RAG + LLM",
+    tags=["Literature Retrieval"],
 )
-async def detect(
-    input_file: UploadFile = File(..., description="The supplemental file to classify"),
-):
-    """
-    Detect whether the uploaded file is:
-    clinical_patient, clinical_sample, mutation, cna_discrete,
-    expression, structural_variant, timeline, or methylation.
-
-    Uses fast column-name heuristics first; falls back to LLM few-shot detection
-    when confidence is low.
-    """
-    try:
-        df, _ = _get_df_and_raw(input_file)
-        result = detect_file_type(
-            df,
-            anthropic_api_key=ANTHROPIC_API_KEY,
-            openai_api_key=OPENAI_API_KEY,
-        )
-        result["columns"] = list(df.columns)
-        result["row_count"] = len(df)
-        return JSONResponse(content=result)
-    except Exception as e:
-        logger.exception("Detection failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ---------------------------------------------------------------------------
-# NEW: Transform endpoint
-# ---------------------------------------------------------------------------
-
-@app.post(
-    "/transform/",
-    summary="Transform supplemental file to cBioPortal format",
-)
-async def transform(
-    input_file: UploadFile = File(..., description="The supplemental file to transform"),
-    cbio_type: str = Form(
-        None,
-        description=(
-            "Target cBioPortal type. If omitted, auto-detected. "
-            "Options: clinical_patient, clinical_sample, mutation, cna_discrete, "
-            "expression, structural_variant, timeline, methylation"
-        ),
-    ),
-    study_id: str = Form("my_study_2025", description="Cancer study identifier"),
-    curator_notes: str = Form("", description="Optional hints for the AI (e.g. 'survival is in days')"),
-    auto_detect: bool = Form(True, description="Auto-detect file type if cbio_type not provided"),
-):
-    """
-    Full pipeline:
-    1. Parse the uploaded file
-    2. Auto-detect or use provided cBioPortal type
-    3. Transform using AI + few-shot examples
-    4. Return both data file and meta file content
-    """
-    try:
-        df, raw_bytes = _get_df_and_raw(input_file)
-
-        # Auto-detect if type not provided
-        column_mappings = {}
-        detection_result = {}
-        if not cbio_type or auto_detect:
-            detection_result = detect_file_type(
-                df,
-                anthropic_api_key=ANTHROPIC_API_KEY,
-                openai_api_key=OPENAI_API_KEY,
-            )
-            if not cbio_type:
-                cbio_type = detection_result["type"]
-            column_mappings = detection_result.get("column_mappings", {})
-
-        if cbio_type not in META_TEMPLATES:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Unknown cbio_type '{cbio_type}'. Valid: {list(META_TEMPLATES.keys())}",
-            )
-
-        result = transform_to_cbio(
-            df=df,
-            cbio_type=cbio_type,
-            study_id=study_id,
-            column_mappings=column_mappings,
-            curator_notes=curator_notes,
-            anthropic_api_key=ANTHROPIC_API_KEY,
-        )
-
-        # Count output rows/cols for summary
-        lines = [l for l in result["data_content"].splitlines() if l and not l.startswith("#")]
-        out_rows = max(len(lines) - 1, 0)  # subtract header
-        out_cols = len(lines[0].split("\t")) if lines else 0
-
-        return JSONResponse(content={
-            "cbio_type": cbio_type,
-            "detection": detection_result,
-            "data_content": result["data_content"],
-            "meta_content": result["meta_content"],
-            "data_filename": result["data_filename"],
-            "meta_filename": result["meta_filename"],
-            "summary": {
-                "input_rows": len(df),
-                "input_cols": len(df.columns),
-                "output_rows": out_rows,
-                "output_cols": out_cols,
-                "study_id": study_id,
-            },
-        })
-
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.exception("Transform failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ---------------------------------------------------------------------------
-# NEW: Save few-shot example (curator feedback loop)
-# ---------------------------------------------------------------------------
-
-@app.post(
-    "/save_example/",
-    summary="Save a curator-corrected example for few-shot learning",
-)
-async def save_example_endpoint(
-    input_file: UploadFile = File(..., description="Original supplemental file"),
-    output_file: UploadFile = File(..., description="Curator-corrected cBioPortal output (TSV)"),
-    cbio_type: str = Form(..., description="The correct cBioPortal type for this example"),
-    description: str = Form("", description="Optional description of what this example teaches"),
-):
-    """
-    Save a new training example. The AI will automatically use this example
-    in future detection and transformation calls (no restart needed).
-    """
-    try:
-        input_raw = await input_file.read()
-        output_raw = await output_file.read()
-
-        input_text = get_raw_text(input_raw, input_file.filename)
-        output_text = output_raw.decode("utf-8", errors="replace")
-
-        eid = save_example(
-            input_tsv=input_text,
-            output_tsv=output_text,
-            cbio_type=cbio_type,
-            description=description,
-        )
-
-        return JSONResponse(content={
-            "message": f"Example {eid} saved successfully. It will be used in future calls.",
-            "example_id": eid,
-            "cbio_type": cbio_type,
-        })
-    except Exception as e:
-        logger.exception("Save example failed")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ---------------------------------------------------------------------------
-# NEW: List examples
-# ---------------------------------------------------------------------------
-
-@app.get("/examples/", summary="List all saved few-shot examples")
-async def list_examples_endpoint():
-    return JSONResponse(content={"examples": list_examples()})
-
-
-# ---------------------------------------------------------------------------
-# NEW: Delete example
-# ---------------------------------------------------------------------------
-
-@app.delete("/examples/{example_id}", summary="Delete a few-shot example")
-async def delete_example_endpoint(example_id: str):
-    deleted = delete_example(example_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail=f"Example '{example_id}' not found")
-    return JSONResponse(content={"message": f"Example {example_id} deleted."})
-
-
-# ---------------------------------------------------------------------------
-# PRESERVED: Original summarize endpoint
-# ---------------------------------------------------------------------------
-
-@app.post("/summarize/", summary="[Original] Summarize a file using RAG")
 async def summarize(
     input_file: UploadFile = File(...),
     prompt_file: UploadFile = File(None),
@@ -277,13 +67,292 @@ async def summarize(
             prompt = load_system_prompt(prompt_path)
 
         try:
-            from backend_summary import summarize_file
-            summary = summarize_file(input_path, prompt=prompt, temperature=temperature, top_k=top_k)
+            from pdf_ingest import process_pdf
+            from vector_store import add_embeddings, search_vector_store
+            from utils import load_chat_model
+            from langchain_core.messages import HumanMessage, SystemMessage
+
+            # Ingest and embed the document
+            chunks = process_pdf(input_path)
+            add_embeddings(chunks)
+
+            # Retrieve relevant context
+            query_text = prompt or "Summarise the key findings of this document."
+            relevant_docs = search_vector_store(query_text, k=top_k)
+            context = "\n\n".join(d.page_content for d in relevant_docs)
+
+            # Build prompt
+            system = prompt or "You are a helpful assistant. Summarise the uploaded document concisely."
+            user_msg = f"Context from document:\n{context}\n\nPlease summarise the key points."
+
+            model = load_chat_model("openai/gpt-4o")
+            response = model.invoke([SystemMessage(content=system), HumanMessage(content=user_msg)])
+            summary = response.content
             return JSONResponse(content={"summary": summary})
-        except ImportError:
-            raise HTTPException(
-                status_code=501,
-                detail="backend_summary module not installed. Original summarize endpoint unavailable.",
+        except Exception as e:
+            return JSONResponse(status_code=500, content={"error": str(e)})
+
+
+# ═════════════════════════════════════════════════════════════
+# TAG: Literature Retrieval — vector store routes
+# ═════════════════════════════════════════════════════════════
+
+@app.post(
+    "/ingest_pdf/",
+    summary="Ingest a PDF into the vector store",
+    tags=["Literature Retrieval"],
+)
+async def ingest_pdf(file: UploadFile = File(...)):
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, file.filename)
+        with open(path, "wb") as f:
+            f.write(await file.read())
+        try:
+            from pdf_ingest import process_pdf
+            from vector_store import add_embeddings
+            chunks = process_pdf(path)
+            n = add_embeddings(chunks)
+            return JSONResponse(content={"status": "ok", "chunks_added": n})
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post(
+    "/clear_vector_store/",
+    summary="Clear all documents from the vector store",
+    tags=["Literature Retrieval"],
+)
+async def clear_vs():
+    try:
+        from vector_store import clear_vector_store
+        clear_vector_store()
+        return JSONResponse(content={"status": "cleared"})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post(
+    "/generate_evidence/",
+    summary="Answer a question using the vector store RAG pipeline",
+    tags=["Literature Retrieval"],
+)
+async def generate_evidence(question: str = Form(...)):
+    try:
+        from vector_store import search_vector_store
+        from utils import load_chat_model
+        from langchain_core.messages import HumanMessage, SystemMessage
+
+        docs = search_vector_store(question, k=5)
+        context = "\n\n".join(docs)
+        system = (
+            "You are an expert biomedical research assistant. "
+            "Answer the question using only the provided context. "
+            "Be concise and cite specific findings where possible."
+        )
+        user_msg = f"Context:\n{context}\n\nQuestion: {question}"
+        model = load_chat_model("openai/gpt-4o")
+        response = model.invoke([SystemMessage(content=system), HumanMessage(content=user_msg)])
+        return JSONResponse(content={"answer": response.content})
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ═════════════════════════════════════════════════════════════
+# TAG: cBioPortal Curation  (unchanged)
+# ═════════════════════════════════════════════════════════════
+
+@app.post(
+    "/curate_cbioportal/",
+    summary="Generate a cBioPortal curation report from a paper PDF + supplementary Excel files",
+    tags=["cBioPortal Curation"],
+)
+async def curate_cbioportal(
+    paper_pdf: UploadFile = File(..., description="Main paper PDF"),
+    supplementary_files: List[UploadFile] = File(
+        default=[], description="Supplementary data files (.xlsx, .xls, .csv, .tsv, .txt, .maf, .doc, .docx)"
+    ),
+    llm_model: str = Form(default="openai/gpt-4o"),
+    temperature: float = Form(default=0.2),
+):
+    with tempfile.TemporaryDirectory() as tmp:
+        pdf_path = os.path.join(tmp, paper_pdf.filename)
+        with open(pdf_path, "wb") as f:
+            f.write(await paper_pdf.read())
+
+        supp_paths: list[str] = []
+        for sf in supplementary_files:
+            if sf.filename:
+                sp = os.path.join(tmp, sf.filename)
+                with open(sp, "wb") as f:
+                    f.write(await sf.read())
+                supp_paths.append(sp)
+
+        try:
+            report_fd, report_path = tempfile.mkstemp(
+                suffix=".docx", prefix="cbio_report_"
+            )
+            os.close(report_fd)
+            result = curate(
+                pdf_path=pdf_path,
+                supp_paths=supp_paths,
+                llm_model=llm_model,
+                temperature=temperature,
+                output_path=report_path,
             )
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
+
+    encoded = urllib.parse.quote(os.path.basename(report_path))
+    result["summary"]["report_download_url"] = f"/download_report/{encoded}"
+    result["summary"]["report_filename"] = os.path.basename(report_path)
+    _REPORT_CACHE[os.path.basename(report_path)] = result["report_path"]
+    return JSONResponse(content=result["summary"])
+
+
+@app.get(
+    "/download_report/{filename}",
+    summary="Download a previously generated curation report",
+    tags=["cBioPortal Curation"],
+)
+async def download_report(filename: str):
+    decoded = urllib.parse.unquote(filename)
+    path = _REPORT_CACHE.get(decoded)
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Report not found or expired.")
+    return FileResponse(
+        path=path,
+        filename=decoded,
+        media_type=(
+            "application/vnd.openxmlformats-officedocument"
+            ".wordprocessingml.document"
+        ),
+    )
+
+
+# ═════════════════════════════════════════════════════════════
+# TAG: Gene Alteration Analysis  (new)
+# ═════════════════════════════════════════════════════════════
+
+@app.post(
+    "/gene_alterations/",
+    summary=(
+        "Upload a MAF / Excel / CSV genomic data file and compute "
+        "per-gene alteration frequencies across all samples"
+    ),
+    tags=["Gene Alteration Analysis"],
+)
+async def gene_alterations(
+    data_file: UploadFile = File(
+        ...,
+        description=(
+            "Genomic data file: MAF (.maf/.txt/.tsv), "
+            "Excel (.xlsx), or CSV (.csv). "
+            "Supports mutation, CNA matrix, and SV/fusion formats."
+        ),
+    ),
+):
+    """
+    Parse the uploaded file and return:
+
+    - **frequencies**: per-gene table with columns
+      `n_mutated`, `pct_mutated`, `n_amp`, `pct_amp`, `n_del`, `pct_del`,
+      `n_sv`, `pct_sv`, `n_any`, `pct_any`, `total_samples`
+    - **summary**: top-line counts (n_samples, n_genes, data types detected)
+    - **session_id**: pass back to `/code_query/` to ask follow-up questions
+
+    Genes are sorted by `pct_any` (highest overall alteration frequency first).
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        fpath = os.path.join(tmp, data_file.filename)
+        with open(fpath, "wb") as f:
+            f.write(await data_file.read())
+
+        try:
+            altdata = load_alteration_data(fpath)
+            freq_df = compute_frequencies(altdata)
+        except Exception as e:
+            raise HTTPException(status_code=422, detail=str(e))
+
+    # Cache for follow-up code queries
+    import hashlib, time
+    session_id = hashlib.md5(
+        f"{data_file.filename}{time.time()}".encode()
+    ).hexdigest()[:12]
+    _ALTERATION_CACHE[session_id] = {"data": altdata, "freq": freq_df}
+
+    freq_records = (
+        freq_df.reset_index().to_dict(orient="records")
+        if not freq_df.empty else []
+    )
+
+    summary = {
+        "n_samples":     altdata.n_samples,
+        "n_genes":       len(freq_df),
+        "has_mutations": altdata.has_mutations,
+        "has_cna":       altdata.has_cna,
+        "has_sv":        altdata.has_sv,
+        "top_genes":     freq_records[:10],
+    }
+
+    return JSONResponse(content={
+        "session_id":  session_id,
+        "summary":     summary,
+        "frequencies": freq_records,
+    })
+
+
+@app.post(
+    "/code_query/",
+    summary=(
+        "Ask a natural-language question about an already-loaded alteration dataset. "
+        "The LLM writes and executes Python code to answer the question."
+    ),
+    tags=["Gene Alteration Analysis"],
+)
+async def code_query(
+    session_id: str = Form(
+        ...,
+        description="session_id returned by a previous /gene_alterations/ call",
+    ),
+    question: str = Form(
+        ...,
+        description="Natural-language question about the data",
+    ),
+    llm_model: str = Form(default="openai/gpt-4o"),
+    temperature: float = Form(default=0.2),
+):
+    """
+    The LLM generates Python code that runs against the cached dataset
+    (df_mut, df_cna, df_sv, df_freq, n_samples) and returns:
+
+    - **answer**: the computed result (table / text / list / dict)
+    - **code**: the Python code that was generated and executed
+    - **explanation**: the LLM's plain-English interpretation
+    - **result_type**: "dataframe" | "text" | "dict" | "list"
+    - **error**: execution error traceback (null if successful)
+    """
+    cached = _ALTERATION_CACHE.get(session_id)
+    if not cached:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Session '{session_id}' not found. "
+                "Upload a data file via /gene_alterations/ first."
+            ),
+        )
+
+    altdata = cached["data"]
+    freq_df = cached["freq"]
+
+    try:
+        result = answer_question(
+            data=altdata,
+            freq_df=freq_df,
+            question=question,
+            model=llm_model,
+            temperature=temperature,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return JSONResponse(content=result)

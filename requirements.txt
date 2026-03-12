@@ -1,19 +1,29 @@
-# Original dependencies
+# ── Web framework ─────────────────────────────────────────────────────────────
 fastapi
-uvicorn
-pypdf2
-python-docx
-pandas
-openpyxl
-ollama
+uvicorn[standard]
+python-multipart          # required for FastAPI File / Form uploads
+
+# ── LLM / RAG stack ───────────────────────────────────────────────────────────
 langchain
-chromadb
 langchain-openai
 langchain-community
 langchain-chroma
+chromadb
+openai
 
-# cBioPortal Transformer additions
-anthropic>=0.25.0
-chardet
-streamlit>=1.35.0
+# ── Document processing ────────────────────────────────────────────────────────
+PyPDF2                    # PDF text extraction
+python-docx               # DOCX generation (curation report)
+openpyxl                  # Excel reading (supplementary files)
+pandas
+numpy
+xlrd                      # Legacy .xls support
+chardet                   # Encoding detection (file_parser.py)
+
+# ── Streamlit UI ───────────────────────────────────────────────────────────────
+streamlit
 requests
+plotly
+
+# ── Utilities ─────────────────────────────────────────────────────────────────
+python-dotenv             # Optional .env support

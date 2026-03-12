@@ -1,3 +1,4 @@
+from typing import Optional, List, Dict, Tuple
 """
 few_shot_manager.py
 ===================
@@ -70,7 +71,7 @@ def save_example(
     return eid
 
 
-def list_examples() -> list[dict]:
+def list_examples() -> List[dict]:
     """Return summary of all saved examples."""
     examples = []
     for f in sorted(glob.glob(os.path.join(FEW_SHOT_DIR, "*.type.txt"))):

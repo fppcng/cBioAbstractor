@@ -1,3 +1,4 @@
+from typing import Optional, List, Dict, Tuple
 """
 cbio_transformer.py
 ===================
@@ -49,7 +50,7 @@ stable_id: mutations
 show_profile_in_analysis_tab: true
 profile_name: Mutations
 profile_description: Somatic mutation data.
-data_filename: data_mutations.maf""",
+data_filename: data_mutations.txt""",
 
     "cna_discrete": lambda study_id: f"""cancer_study_identifier: {study_id}
 genetic_alteration_type: COPY_NUMBER_ALTERATION
@@ -96,7 +97,7 @@ data_filename: data_methylation_hm450.txt""",
 DATA_FILENAMES = {
     "clinical_patient": "data_clinical_patient.txt",
     "clinical_sample": "data_clinical_sample.txt",
-    "mutation": "data_mutations.maf",
+    "mutation": "data_mutations.txt",
     "cna_discrete": "data_cna.txt",
     "expression": "data_expression.txt",
     "structural_variant": "data_sv.txt",
@@ -204,7 +205,7 @@ METHYLATION FORMAT:
 # Few-shot example loader (type-specific)
 # ---------------------------------------------------------------------------
 
-def load_few_shot_examples_for_type(cbio_type: str) -> list[dict]:
+def load_few_shot_examples_for_type(cbio_type: str) -> List[dict]:
     """Load only examples matching the target cBioPortal type."""
     examples = []
     type_files = glob.glob(os.path.join(FEW_SHOT_DIR, "*.type.txt"))
@@ -307,9 +308,9 @@ def transform_to_cbio(
     df: pd.DataFrame,
     cbio_type: str,
     study_id: str = "my_study_2025",
-    column_mappings: dict | None = None,
+    column_mappings: Optional[dict] = None,
     curator_notes: str = "",
-    anthropic_api_key: str | None = None,
+    anthropic_api_key: Optional[str] = None,
 ) -> dict:
     """
     Transform df into cBioPortal format.
