@@ -19,7 +19,7 @@ def _wake_backend(placeholder):
     Shows a live status message in *placeholder* while waiting.
     Returns True if the backend is up, False if it never responded.
     """
-    for attempt in range(1, 13):          # up to ~60 s
+    for attempt in range(1, 19):          # up to ~90 s
         try:
             r = requests.get(API_URL + "/docs", timeout=10)
             if r.status_code < 500:
@@ -29,11 +29,11 @@ def _wake_backend(placeholder):
             pass
         placeholder.info(
             f"⏳ Waking up the server… ({attempt * 5} s elapsed)  \n"
-            "The backend may be starting from sleep — this usually takes under 60 s."
+            "The backend may be starting from sleep — this usually takes 30–90 s on Render free tier."
         )
         time.sleep(5)
     placeholder.error(
-        "❌ Backend did not respond after 60 s. "
+        "❌ Backend did not respond after 90 s. "
         "Check that the Render service is running."
     )
     return False
@@ -605,4 +605,3 @@ with tab_gene:
                     })
                 else:
                     st.error(f"Error ({qa_resp.status_code}): {qa_resp.text[:300]}")
-
