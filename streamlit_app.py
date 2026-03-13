@@ -21,7 +21,7 @@ def _wake_backend(placeholder):
     """
     for attempt in range(1, 19):          # up to ~90 s
         try:
-            r = requests.get(API_URL + "/docs", timeout=10)
+            r = requests.get(API_URL + "/", timeout=10)
             if r.status_code < 500:
                 placeholder.empty()
                 return True
@@ -605,3 +605,4 @@ with tab_gene:
                     })
                 else:
                     st.error(f"Error ({qa_resp.status_code}): {qa_resp.text[:300]}")
+

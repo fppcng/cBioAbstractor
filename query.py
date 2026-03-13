@@ -43,6 +43,10 @@ _ALTERATION_CACHE: dict[str, object] = {}   # session_id → {data, freq}
 # TAG: Literature Retrieval  (unchanged)
 # ═════════════════════════════════════════════════════════════
 
+@app.get("/")
+def root():
+    return {"status": "ok", "service": "Synopsis backend", "version": "3.0.0"}
+
 @app.post(
     "/summarize/",
     summary="Summarise an uploaded file using RAG + LLM",
