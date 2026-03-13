@@ -8,14 +8,14 @@ langchain==0.3.20
 langchain-openai==0.3.8
 langchain-community==0.3.19
 langchain-chroma==0.2.2
-chromadb==0.6.3
+chromadb==0.5.23
 openai==1.68.2
 
 # ── Document processing ───────────────────────────────────────────────────────
 pypdf==5.4.0
 python-docx==1.1.2
 openpyxl==3.1.5
-pandas==2.2.3
+pandas>=2.0.0
 xlrd==2.0.1
 pdfplumber==0.11.4
 
