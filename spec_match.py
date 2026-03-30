@@ -56,7 +56,7 @@ def _sheet_col_tokens(df: pd.DataFrame) -> set[str]:
     tokens: set[str] = set()
     for col in df.columns:
         tokens.add(_normalise(col))
-    for _, row in df.head(3).iterrows():
+    for _, row in df.head(8).iterrows():
         for val in row:
             if pd.notna(val) and isinstance(val, str):
                 tokens.add(_normalise(val))
