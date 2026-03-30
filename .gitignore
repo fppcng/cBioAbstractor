@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.python-version
+
+*.log
+*.sqlite3
+cbio-studies/
+vector_store/
+
+background.txt
+
+validateData.py
