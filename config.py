@@ -5,6 +5,9 @@ Central configuration for the Synopsis backend.
 All tunable constants live here.
 """
 import os
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ── API keys ──────────────────────────────────────────────────────────────────
 OPENAI_API_KEY     = os.getenv("OPENAI_API_KEY")

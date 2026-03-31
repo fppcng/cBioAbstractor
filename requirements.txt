@@ -19,3 +19,4 @@ langchain-openai
 fastapi
 python-multipart
 uvicorn
+rapidfuzz

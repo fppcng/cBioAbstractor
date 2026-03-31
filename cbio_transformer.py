@@ -94,6 +94,19 @@ profile_description: Methylation beta-values (HM450 platform).
 data_filename: data_methylation_hm450.txt""",
 }
 
+# Maps keys from classify_sheet() (spec_match.py) → transformer keys
+_SPEC_KEY_MAP: dict[str, str] = {
+    "CLINICAL_PATIENT":  "clinical_patient",
+    "CLINICAL_SAMPLE":   "clinical_sample",
+    "MUTATION_MAF":      "mutation",
+    "DISCRETE_CNA":      "cna_discrete",
+    "CONTINUOUS_CNA":    "cna_discrete",
+    "EXPRESSION":        "expression",
+    "STRUCTURAL_VARIANT": "structural_variant",
+    "METHYLATION":       "methylation",
+    "TIMELINE":          "timeline",
+}
+
 DATA_FILENAMES = {
     "clinical_patient": "data_clinical_patient.txt",
     "clinical_sample": "data_clinical_sample.txt",
@@ -239,13 +252,14 @@ def _llm_transform(
     study_id: str,
     column_mappings: dict,
     curator_notes: str,
-    anthropic_api_key: str,
+    llm_model: str,
 ) -> str:
     """
-    Call Claude to transform df into cBioPortal format.
-    Returns transformed TSV as a string.
+    Transform df into cBioPortal format using the configured LLM.
+    Returns the transformed TSV as a string.
     """
-    import anthropic
+    from utils import load_chat_model
+    from langchain_core.messages import HumanMessage, SystemMessage
 
     examples = load_few_shot_examples_for_type(cbio_type)
 
@@ -285,15 +299,10 @@ Cancer study identifier: {study_id}
 Return ONLY the properly formatted cBioPortal TSV. No explanations. No markdown fences.
 """
 
-    client = anthropic.Anthropic(api_key=anthropic_api_key)
-    response = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=4096,
-        system=system,
-        messages=[{"role": "user", "content": user}],
-    )
+    model = load_chat_model(llm_model)
+    response = model.invoke([SystemMessage(content=system), HumanMessage(content=user)])
+    raw = response.content
 
-    raw = response.content[0].text
     # Strip any accidental markdown fences
     raw = re.sub(r"^```[^\n]*\n?", "", raw, flags=re.MULTILINE)
     raw = re.sub(r"```$", "", raw, flags=re.MULTILINE).strip()
@@ -310,7 +319,7 @@ def transform_to_cbio(
     study_id: str = "my_study_2025",
     column_mappings: Optional[dict] = None,
     curator_notes: str = "",
-    anthropic_api_key: Optional[str] = None,
+    llm_model: str = "openai/gpt-4o",
 ) -> dict:
     """
     Transform df into cBioPortal format.
@@ -324,8 +333,7 @@ def transform_to_cbio(
         "cbio_type": str,
     }
     """
-    if not anthropic_api_key:
-        raise ValueError("ANTHROPIC_API_KEY is required for transformation.")
+    cbio_type = _SPEC_KEY_MAP.get(cbio_type.upper(), cbio_type)
 
     data_content = _llm_transform(
         df=df,
@@ -333,7 +341,7 @@ def transform_to_cbio(
         study_id=study_id,
         column_mappings=column_mappings or {},
         curator_notes=curator_notes,
-        anthropic_api_key=anthropic_api_key,
+        llm_model=llm_model,
     )
 
     meta_content = META_TEMPLATES[cbio_type](study_id)

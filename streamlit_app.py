@@ -89,10 +89,11 @@ st.caption(
     "cBioPortal Curation  ·  Gene Alteration Analysis"
 )
 
-tab_lit, tab_cbio, tab_gene = st.tabs([
+tab_lit, tab_cbio, tab_gene, tab_fmt = st.tabs([
     "📚  Literature Retrieval",
     "🗂️  cBioPortal Curator",
     "🧪  Gene Alterations & Code Q&A",
+    "⚙️  Format for cBioPortal",
 ])
 
 
@@ -606,3 +607,188 @@ with tab_gene:
                 else:
                     st.error(f"Error ({qa_resp.status_code}): {qa_resp.text[:300]}")
 
+
+# ═══════════════════════════════════════════════════════════════════════
+# TAB 4 — Format for cBioPortal
+# ═══════════════════════════════════════════════════════════════════════
+
+with tab_fmt:
+    st.subheader("Format Supplemental File for cBioPortal")
+    st.markdown(
+        """
+        Upload a **TSV, CSV, or Excel** file with arbitrary column names.
+        The pipeline will:
+        - Auto-detect the cBioPortal format type (clinical, mutation, CNA…)
+        - Fuzzy-match your columns to the canonical schema
+        - Rewrite the file into the exact cBioPortal format
+        - Package the **data file + meta file** into a ZIP ready to upload
+        """
+    )
+    st.divider()
+
+    # Session state
+    if "fmt_result" not in st.session_state:
+        st.session_state["fmt_result"] = None
+    if "fmt_download_url" not in st.session_state:
+        st.session_state["fmt_download_url"] = None
+    if "fmt_zip_name" not in st.session_state:
+        st.session_state["fmt_zip_name"] = None
+
+    # ── Upload + options ───────────────────────────────────────────────
+    col_up, col_opts = st.columns([1, 1])
+
+    with col_up:
+        st.markdown("#### 1.  Upload File")
+        fmt_file = st.file_uploader(
+            "Supplemental data file (.tsv, .csv, .xlsx)",
+            type=["tsv", "csv", "xlsx", "xls", "txt"],
+            key="fmt_data_file",
+        )
+
+    with col_opts:
+        st.markdown("#### 2.  Options")
+        fmt_study_id = st.text_input(
+            "Study ID",
+            value="my_study_2025",
+            help="cBioPortal cancer_study_identifier (e.g. brca_tcga_2024)",
+        )
+        fmt_cbio_type = st.selectbox(
+            "Format type override (leave blank for auto-detect)",
+            options=[
+                "",
+                "clinical_patient",
+                "clinical_sample",
+                "mutation",
+                "cna_discrete",
+                "expression",
+                "structural_variant",
+                "timeline",
+                "methylation",
+            ],
+            index=0,
+            help="Override auto-detection if you already know the format.",
+        )
+        fmt_curator_notes = st.text_area(
+            "Curator notes (optional)",
+            placeholder="e.g. 'survival time is in days, convert to months'",
+            height=80,
+        )
+        with st.expander("⚙️  Advanced"):
+            fmt_llm_model = st.selectbox(
+                "LLM model",
+                ["openai/gpt-4o", "openai/gpt-4-turbo", "openai/gpt-3.5-turbo"],
+                key="fmt_llm_model",
+            )
+
+    st.divider()
+
+    # ── Run button ─────────────────────────────────────────────────────
+    if st.button(
+        "🚀  Format File",
+        disabled=(fmt_file is None),
+        type="primary",
+        key="fmt_run_btn",
+    ):
+        # Reset previous results
+        st.session_state["fmt_result"] = None
+        st.session_state["fmt_download_url"] = None
+        st.session_state["fmt_zip_name"] = None
+
+        wake_ph = st.empty()
+        if not _wake_backend(wake_ph):
+            st.stop()
+
+        with st.spinner("Detecting format, mapping columns, transforming…"):
+            form_data = {
+                "study_id":       fmt_study_id,
+                "curator_notes":  fmt_curator_notes,
+                "llm_model":      fmt_llm_model,
+            }
+            if fmt_cbio_type:
+                form_data["cbio_type"] = fmt_cbio_type
+
+            try:
+                resp = requests.post(
+                    f"{API_URL}/format_for_cbio/",
+                    files={"data_file": (fmt_file.name, fmt_file.getvalue())},
+                    data=form_data,
+                    timeout=TIMEOUT_NORMAL,
+                )
+            except requests.exceptions.Timeout:
+                st.error("⏱️ Request timed out. Try a smaller file.")
+                st.stop()
+            except requests.exceptions.ConnectionError as e:
+                st.error(f"🔌 Connection error: {e}")
+                st.stop()
+
+        if resp.status_code == 200:
+            payload = resp.json()
+            st.session_state["fmt_result"] = payload
+            st.session_state["fmt_download_url"] = payload.get("download_url")
+            st.session_state["fmt_zip_name"] = payload.get("zip_filename")
+            st.success("✅ Formatting complete!")
+        else:
+            st.error(f"Error ({resp.status_code}): {resp.json().get('detail', resp.text[:300])}")
+
+    # ── Results ────────────────────────────────────────────────────────
+    if st.session_state["fmt_result"]:
+        result = st.session_state["fmt_result"]
+        det    = result.get("detection", {})
+        out    = result.get("output", {})
+
+        st.divider()
+        st.markdown("### Detection")
+
+        d1, d2, d3 = st.columns(3)
+        d1.metric("Format Type",  det.get("cbio_type", "—"))
+        d2.metric("Confidence",   f"{det.get('confidence', 0):.0f}%")
+        d3.metric("Method",       det.get("method", "—"))
+
+        st.caption(det.get("reasoning", ""))
+
+        if det.get("low_confidence"):
+            st.warning("Low confidence detection — review the output carefully.")
+
+        if det.get("required_missing"):
+            st.warning(
+                "Missing required columns: "
+                + ", ".join(det["required_missing"])
+                + "  — the LLM will attempt to synthesise or infer them."
+            )
+
+        if det.get("column_mappings"):
+            with st.expander("🔍  Column mappings applied"):
+                mappings_df = pd.DataFrame(
+                    det["column_mappings"].items(),
+                    columns=["Input column", "→ cBioPortal canonical"],
+                )
+                st.dataframe(mappings_df, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.markdown("### Output preview")
+
+        tab_data, tab_meta = st.tabs(["Data file", "Meta file"])
+        with tab_data:
+            st.code(out.get("data_preview", ""), language="text")
+            st.caption(f"Full file: `{out.get('data_filename', '')}`")
+        with tab_meta:
+            st.code(out.get("meta_content", ""), language="text")
+            st.caption(f"File: `{out.get('meta_filename', '')}`")
+
+        st.divider()
+
+        # Download button — only active once results are ready
+        dl_url = st.session_state["fmt_download_url"]
+        zip_name = st.session_state["fmt_zip_name"]
+        if dl_url:
+            dl = requests.get(f"{API_URL}{dl_url}", timeout=TIMEOUT_FAST)
+            if dl.status_code == 200:
+                st.download_button(
+                    "📥  Download ZIP (data + meta files)",
+                    data=dl.content,
+                    file_name=zip_name or "cbio_formatted.zip",
+                    mime="application/zip",
+                    type="primary",
+                )
+            else:
+                st.error("Could not fetch the ZIP archive from the server.")

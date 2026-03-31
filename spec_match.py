@@ -23,9 +23,12 @@ Returns ClassificationResult with:
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
+import logging
 import pandas as pd
 from cbioportal_spec import FormatSpec
-from spec_fetcher import fetch_spec
+from spec_fetcher import fetch_spec, get_spec_or_fallback
+
+logger = logging.getLogger(__name__)
 
 CONFIDENCE_THRESHOLD = 40
 MATRIX_PENALTY       = 25
@@ -141,10 +144,23 @@ def classify_sheet(df: pd.DataFrame,
     spec_fetched = fetch_result.get("fetched_at", "unknown")
     spec_by_key  = {s.key: s for s in live_specs}
 
+    logger.info("classify_sheet: spec_source=%s, n_specs=%d", spec_source, len(live_specs))
+
     col_tokens = _sheet_col_tokens(df)
+    logger.info("classify_sheet: col_tokens=%s", sorted(col_tokens))
+
     scores     = [_match_spec(s, col_tokens, df) for s in live_specs]
     scores.sort(key=lambda x: x["confidence"], reverse=True)
     best = scores[0]
+
+    logger.info(
+        "classify_sheet: top-3 scores: %s",
+        [(s["key"], s["confidence"]) for s in scores[:3]],
+    )
+    logger.info(
+        "classify_sheet: winner=%s confidence=%.1f req_present=%s req_missing=%s alias_map=%s",
+        best["key"], best["confidence"], best["req_present"], best["req_missing"], best["alias_map"],
+    )
 
     # Top-5 candidates for the alternative-format display
     all_scores_summary = [
@@ -207,3 +223,64 @@ def classify_sheet(df: pd.DataFrame,
         spec_source=spec_source,
         spec_fetched_at=spec_fetched,
     )
+
+
+
+def fuzzy_map_columns(
+    df: pd.DataFrame,
+    spec_key: str,
+    threshold: int = 70,
+) -> dict[str, str]:
+    """
+    Fuzzy-match input DataFrame columns against all canonical cBioPortal field
+    names (required + optional + aliases) for the given format spec key.
+
+    Returns {input_column: canonical_cbio_column} for matches above threshold.
+    Exact alias matches are always included regardless of threshold.
+    Direction is input_col → canonical, ready to use as transformer hint.
+    """
+    from rapidfuzz import fuzz, process as fuzz_process
+
+    specs = get_spec_or_fallback()
+    spec = next((s for s in specs if s.key == spec_key), None)
+    if not spec:
+        logger.warning("fuzzy_map_columns: spec_key '%s' not found", spec_key)
+        return {}
+
+    # Build alias → canonical reverse map (all normalized)
+    alias_to_canon: dict[str, str] = {}
+    for canon in spec.required + spec.optional:
+        alias_to_canon[_normalise(canon)] = canon
+        for alias in spec.aliases.get(canon, []):
+            alias_to_canon[_normalise(alias)] = canon
+
+    mappings: dict[str, str] = {}
+    for input_col in df.columns:
+        norm_col = _normalise(input_col)
+
+        if norm_col in alias_to_canon:
+            mappings[input_col] = alias_to_canon[norm_col]
+            continue
+
+        # Replace underscores with spaces so token_sort_ratio tokenizes correctly.
+        # e.g. "survival_months" → "survival months" matches alias "survival months"
+        fuzz_col = norm_col.replace("_", " ")
+        fuzz_candidates = {k.replace("_", " "): v for k, v in alias_to_canon.items()}
+
+        match = fuzz_process.extractOne(
+            fuzz_col,
+            list(fuzz_candidates.keys()),
+            scorer=fuzz.token_sort_ratio,
+            score_cutoff=threshold,
+        )
+        if match:
+            matched_alias, score, _ = match
+            canonical = fuzz_candidates[matched_alias]
+            mappings[input_col] = canonical
+            logger.info(
+                "fuzzy_map_columns: '%s' → '%s' via '%s' (score=%d)",
+                input_col, canonical, matched_alias, score,
+            )
+
+    logger.info("fuzzy_map_columns: %d/%d columns mapped", len(mappings), len(df.columns))
+    return mappings

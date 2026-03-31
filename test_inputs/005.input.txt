@@ -1,0 +1,28 @@
+#Patient Identifier	Diagnosis	Stage	Diagnosis Age	Sex	Ethnicity Category
+#Identifier to uniquely specify a patient.	Diagnosis.	Stage	Age at which a condition or disease was first diagnosed.	Sex	The text for reporting information about ethnicity.
+#STRING	STRING	STRING	NUMBER	STRING	STRING
+#1	1	1	1	1	1
+PATIENT_ID	DIAGNOSIS	STAGE	AGE	SEX	ETHNICITY
+ACINAR01	Acinar cell carcinoma	1B	53	Male	White
+ACINAR02	Acinar cell carcinoma	2B	77	Male	White
+ACINAR03	Acinar cell carcinoma	2B	60	Male	White
+ACINAR04	Mixed Acinar-Ductal Carcinoma	2B	73	Female	White
+ACINAR05	Acinar cell carcinoma	2A	56	Male	White
+ACINAR06	Acinar cell carcinoma	1B	55	Female	White
+ACINAR08	Mixed Acinar-Neuroendocrine Carcinoma	1B	19	Female	White
+ACINAR09	Acinar Cell Carcinoma	2A	37	Female	White
+ACINAR10	Mixed Acinar-Ductal Carcinoma	2B	52	Male	Unknown
+ACINAR11	Acinar Cell Carcinoma	2A	66	Male	Unknown
+ACINAR13	Acinar Cell Carcinoma	2B	79	Male	Unknown
+ACINAR14	Acinar Cell Carcinoma	2B	69	Male	Unknown
+ACINAR15	Acinar cell carcinoma	1B	71	Male	White
+ACINAR17	Pancreatoblastoma	2B	57	Female	Black or African American
+ACINAR18	Mixed Acinar-Ductal Carcinoma	2B	70	Male	White
+ACINAR19	Pancreatoblastoma	2B	51	Male	White
+ACINAR20	Acinar cell carcinoma	2B	78	Male	White
+ACINAR21	Acinar cell carcinoma	1A	65	Male	White
+ACINAR25	Acinar Cell Carcinoma	2A	47	Male	Unknown
+ACINAR26	Acinar Cell Carcinoma	1B	67	Male	Unknown
+ACINAR27	Acinar Cell Carcinoma	1B	70	Male	Unknown
+ACINAR28	Acinar Cell Carcinoma	3	74	Female	Unknown
+ACINAR29	Acinar Cell Carcinoma	1B	63	Female	Unknown

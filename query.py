@@ -1,10 +1,17 @@
+import logging
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(name)s | %(levelname)s | %(message)s",
+)
+
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 import os
 import tempfile
 import urllib.parse
-from typing import List
+from typing import List, Optional
 
 from system_prompt_config import load_system_prompt
 from cbioportal_curator import curate
@@ -37,6 +44,7 @@ app.add_middleware(
 
 _REPORT_CACHE: dict[str, str] = {}          # report filename → abs path
 _ALTERATION_CACHE: dict[str, object] = {}   # session_id → {data, freq}
+_FORMATTED_CACHE: dict[str, str] = {}       # zip filename → abs path
 
 
 # ═════════════════════════════════════════════════════════════
@@ -360,3 +368,192 @@ async def code_query(
         raise HTTPException(status_code=500, detail=str(e))
 
     return JSONResponse(content=result)
+
+
+# ═════════════════════════════════════════════════════════════
+# TAG: cBioPortal Formatting Pipeline
+# ═════════════════════════════════════════════════════════════
+
+@app.post(
+    "/format_for_cbio/",
+    summary=(
+        "Upload a TSV/CSV/Excel file with arbitrary columns and receive "
+        "a cBioPortal-ready data file + matching meta file."
+    ),
+    tags=["cBioPortal Formatting"],
+)
+async def format_for_cbio(
+    data_file: UploadFile = File(
+        ...,
+        description=(
+            "Supplemental data file with non-standard column names "
+            "(.tsv, .csv, .xlsx). The pipeline auto-detects the cBioPortal "
+            "format type and transforms it accordingly."
+        ),
+    ),
+    study_id: str = Form(
+        default="my_study_2025",
+        description="cBioPortal cancer study identifier (e.g. 'brca_tcga_2024')",
+    ),
+    cbio_type: Optional[str] = Form(
+        default=None,
+        description=(
+            "Override auto-detection. One of: clinical_patient, clinical_sample, "
+            "mutation, cna_discrete, expression, structural_variant, timeline, methylation"
+        ),
+    ),
+    curator_notes: str = Form(
+        default="",
+        description=(
+            "Optional free-text hints for the LLM "
+            "(e.g. 'survival time is in days, convert to months')"
+        ),
+    ),
+    llm_model: str = Form(
+        default="openai/gpt-4o",
+        description="LLM used for transformation (e.g. 'openai/gpt-4o')",
+    ),
+):
+    """
+    Full formatting pipeline:
+
+    1. **Parse** — auto-detect encoding + delimiter, load into DataFrame
+    2. **Detect** — heuristic + LLM few-shot classification of the cBioPortal format type
+    3. **Transform** — LLM rewrites columns, values, and header rows to match the spec
+    4. **Package** — zip data file + meta file ready for cBioPortal upload
+
+    Returns detection metadata, a preview of the formatted output, and a `download_url`
+    for the ZIP archive containing both files.
+    """
+    file_bytes = await data_file.read()
+
+    # 1. Parse
+    try:
+        from file_parser import parse_file
+        df = parse_file(file_bytes, data_file.filename)
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"Could not parse file: {e}")
+
+    if df.empty:
+        raise HTTPException(status_code=422, detail="Parsed file is empty.")
+
+
+
+    # 2. Detect format type (or use caller-supplied override)
+    from spec_match import classify_sheet, fuzzy_map_columns
+
+    VALID_CBIO_TYPES = {
+        "clinical_patient", "clinical_sample", "mutation", "cna_discrete",
+        "expression", "structural_variant", "timeline", "methylation",
+    }
+    if cbio_type and cbio_type not in VALID_CBIO_TYPES:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Invalid cbio_type '{cbio_type}'. "
+                f"Valid values: {sorted(VALID_CBIO_TYPES)}"
+            ),
+        )
+
+    if cbio_type:
+        cls = None
+        resolved_type = cbio_type
+        detection = {
+            "cbio_type":       cbio_type,
+            "confidence":      1.0,
+            "method":          "user_override",
+            "reasoning":       "Format type manually specified by caller.",
+            "column_mappings": {},
+            "required_missing": [],
+            "low_confidence":  False,
+        }
+    else:
+        cls = classify_sheet(df)
+        if cls.format_key == "NOT_LOADABLE":
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"Could not determine the cBioPortal format type "
+                    f"(best candidate: {cls.all_scores[0]['format']} "
+                    f"@ {cls.all_scores[0]['confidence']:.0f}%). "
+                    "Please specify 'cbio_type' manually."
+                ),
+            )
+        resolved_type = cls.format_key
+        fuzzy_mappings = fuzzy_map_columns(df, cls.format_key)
+        detection = {
+            "cbio_type":        cls.format_key,
+            "confidence":       cls.confidence,
+            "method":           f"spec_match ({cls.spec_source})",
+            "reasoning":        cls.verdict,
+            "column_mappings":  fuzzy_mappings,
+            "required_missing": cls.required_missing,
+            "low_confidence":   cls.confidence < 70,
+        }
+
+    # 3. Transform
+    from cbio_transformer import transform_to_cbio
+
+    try:
+        result = transform_to_cbio(
+            df=df,
+            cbio_type=resolved_type,
+            study_id=study_id,
+            column_mappings=detection.get("column_mappings") or {},
+            curator_notes=curator_notes,
+            llm_model=llm_model,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Transformation failed: {e}")
+
+    # 4. Package as ZIP
+    import zipfile
+
+    zip_fd, zip_path = tempfile.mkstemp(suffix=".zip", prefix="cbio_fmt_")
+    os.close(zip_fd)
+
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(result["data_filename"], result["data_content"])
+        zf.writestr(result["meta_filename"], result["meta_content"])
+
+    zip_name = os.path.basename(zip_path)
+    _FORMATTED_CACHE[zip_name] = zip_path
+
+    encoded = urllib.parse.quote(zip_name)
+    preview = "\n".join(result["data_content"].splitlines()[:5])
+
+    return JSONResponse(content={
+        "detection": {
+            "cbio_type":       detection["cbio_type"],
+            "confidence":      detection["confidence"],
+            "method":          detection["method"],
+            "reasoning":       detection.get("reasoning", ""),
+            "column_mappings": detection.get("column_mappings", {}),
+            "low_confidence":  detection.get("low_confidence", False),
+        },
+        "output": {
+            "data_filename": result["data_filename"],
+            "meta_filename": result["meta_filename"],
+            "data_preview":  preview,
+            "meta_content":  result["meta_content"],
+        },
+        "download_url": f"/download_formatted/{encoded}",
+        "zip_filename":  zip_name,
+    })
+
+
+@app.get(
+    "/download_formatted/{filename}",
+    summary="Download the ZIP archive with the cBioPortal-ready data + meta files",
+    tags=["cBioPortal Formatting"],
+)
+async def download_formatted(filename: str):
+    decoded = urllib.parse.unquote(filename)
+    path = _FORMATTED_CACHE.get(decoded)
+    if not path or not os.path.exists(path):
+        raise HTTPException(status_code=404, detail="Formatted archive not found or expired.")
+    return FileResponse(
+        path=path,
+        filename=decoded,
+        media_type="application/zip",
+    )
