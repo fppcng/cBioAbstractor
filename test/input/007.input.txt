@@ -1,0 +1,18 @@
+patient_id	met_disease_at_last_fup	time_to_met_recurrence_months	prior_local_recurrence	sex	menopausal_status_at_dx	laterality	t_stage	n_stage	m_stage	receptor_subtype	hr_status	her2_status	her2_primary_status	vital_status	last_contact_days	time_to_death_months	dfs_months	dfs_event	os_months	survival_status
+P-0000004	Yes	446.0	No	Female	Pre	Left	T1c	N3a	M1	HR+/HER2-	Positive	Negative	Negative	Alive	14484		1.1	1	31.5	Alive
+P-0000012	No		No	Female	Pre	Right	T2	N0	M0	Triple Negative	Negative	Negative	Negative	Alive	22336		218.0	0	218.0	Alive
+P-0000015	Yes	519.0	No	Female	Pre	Right	T1b	N1mi	M0	HR+/HER2-	Positive	Negative	Negative	Deceased	16656	548.0	68.9	1	98.0	Deceased
+P-0000041	Yes	604.0	No	Female	Pre	Left	T1b	N0	M0	HR+/HER2+	Positive	Positive	Positive	Deceased	19364	637.0	90.2	1	123.1	Deceased
+P-0000057	Yes	459.0	No	Female	Pre	Left	TX	NX	M1	HR+/HER2-	Positive	Negative	Negative	Deceased	15871	522.0	0.5	1	63.6	Deceased
+P-0000058	Yes	593.0	No	Female	Pre	Left	TX	NX	M1	HR+/HER2+	Positive	Positive	Positive	Alive	19297		0.0	1	41.8	Alive
+P-0000066	Yes	744.0	Yes	Female	Pre	Right	T1c	N1a	M0	HR+/HER2-	Positive	Negative	Unk/ND	Alive	23697		225.1	1	260.6	Alive
+P-0000075	Yes	773.0	No	Female	Pre	Right	T1c	N0	M0	HR+/HER2-	Positive	Negative	Unk/ND	Deceased	25299	832.0	181.2	1	240.8	Deceased
+P-0000077	Yes	858.0	No	Female	Post	Right	T2	N2a	M0	HR+/HER2+	Positive	Positive	Positive	Alive	27809		135.4	1	192.2	Alive
+P-0000081	Yes	546.0	No	Female	Pre	Left	T3	N1a	M0	HR+/HER2-	Positive	Negative	Negative	Alive	18421		58.1	1	118.1	Alive
+P-0000093	Yes	599.0	No	Female	Pre	Left	T3	N1a	M0	HR+/HER2-	Positive	Negative	Negative	Deceased	19159	630.0	19.0	1	49.8	Deceased
+P-0000098	Yes	777.0	No	Female	Post	Right	T3	N1a	M0	HR+/HER2-	Positive	Negative	Negative	Alive	25329		12.1	1	68.5	Alive
+P-0000102	Yes	739.0	No	Female	Post	Right	T1c	N0	M0	HR+/HER2-	Positive	Negative	Equivocal	Deceased	23571	775.0	103.2	1	139.4	Deceased
+P-0000104	Yes	691.0	No	Female	Pre	Right	T1b	N0	M0	HR+/HER2-	Positive	Negative	Negative	Alive	22109		89.5	1	125.3	Alive
+P-0000106	Yes	633.0	No	Female	Peri	Right	T1c	N3a	M0	HR+/HER2-	Positive	Negative	Negative	Deceased	20018	658.0	12.6	1	37.9	Deceased
+P-0000107	Yes	575.0	Yes	Female	Pre	Right	T2	N0	M0	HR+/HER2-	Positive	Negative	Negative	Alive	18507		18.5	1	52.2	Alive
+P-0000120	Yes	632.0	Yes	Female	Pre	Left	T1a	N0	M0	HR+/HER2-	Positive	Negative	Negative	Alive	20272		124.8	1	160.0	Alive

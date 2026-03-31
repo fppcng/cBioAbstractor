@@ -437,11 +437,14 @@ async def format_for_cbio(
     if df.empty:
         raise HTTPException(status_code=422, detail="Parsed file is empty.")
 
+    # 2. Fuzzy-normalise column names (cross-spec, before detection)
+    from spec_match import classify_sheet, fuzzy_normalize_columns
+    original_columns = list(df.columns)
+    df, column_mappings = fuzzy_normalize_columns(df)
+    unmapped_columns = [c for c in original_columns if c not in column_mappings]
 
 
-    # 2. Detect format type (or use caller-supplied override)
-    from spec_match import classify_sheet, fuzzy_map_columns
-
+    # 3. Detect format type (or use caller-supplied override)
     VALID_CBIO_TYPES = {
         "clinical_patient", "clinical_sample", "mutation", "cna_discrete",
         "expression", "structural_variant", "timeline", "methylation",
@@ -459,13 +462,14 @@ async def format_for_cbio(
         cls = None
         resolved_type = cbio_type
         detection = {
-            "cbio_type":       cbio_type,
-            "confidence":      1.0,
-            "method":          "user_override",
-            "reasoning":       "Format type manually specified by caller.",
-            "column_mappings": {},
+            "cbio_type":        cbio_type,
+            "confidence":       1.0,
+            "method":           "user_override",
+            "reasoning":        "Format type manually specified by caller.",
+            "column_mappings":  column_mappings,
+            "unmapped_columns": unmapped_columns,
             "required_missing": [],
-            "low_confidence":  False,
+            "low_confidence":   False,
         }
     else:
         cls = classify_sheet(df)
@@ -480,18 +484,18 @@ async def format_for_cbio(
                 ),
             )
         resolved_type = cls.format_key
-        fuzzy_mappings = fuzzy_map_columns(df, cls.format_key)
         detection = {
             "cbio_type":        cls.format_key,
             "confidence":       cls.confidence,
             "method":           f"spec_match ({cls.spec_source})",
             "reasoning":        cls.verdict,
-            "column_mappings":  fuzzy_mappings,
+            "column_mappings":  column_mappings,
+            "unmapped_columns": unmapped_columns,
             "required_missing": cls.required_missing,
             "low_confidence":   cls.confidence < 70,
         }
 
-    # 3. Transform
+    # 4. Transform
     from cbio_transformer import transform_to_cbio
 
     try:
@@ -506,7 +510,7 @@ async def format_for_cbio(
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Transformation failed: {e}")
 
-    # 4. Package as ZIP
+    # 5. Package as ZIP
     import zipfile
 
     zip_fd, zip_path = tempfile.mkstemp(suffix=".zip", prefix="cbio_fmt_")
@@ -524,12 +528,13 @@ async def format_for_cbio(
 
     return JSONResponse(content={
         "detection": {
-            "cbio_type":       detection["cbio_type"],
-            "confidence":      detection["confidence"],
-            "method":          detection["method"],
-            "reasoning":       detection.get("reasoning", ""),
-            "column_mappings": detection.get("column_mappings", {}),
-            "low_confidence":  detection.get("low_confidence", False),
+            "cbio_type":        detection["cbio_type"],
+            "confidence":       detection["confidence"],
+            "method":           detection["method"],
+            "reasoning":        detection.get("reasoning", ""),
+            "column_mappings":  detection.get("column_mappings", {}),
+            "unmapped_columns": detection.get("unmapped_columns", []),
+            "low_confidence":   detection.get("low_confidence", False),
         },
         "output": {
             "data_filename": result["data_filename"],

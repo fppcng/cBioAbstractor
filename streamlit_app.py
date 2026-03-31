@@ -756,13 +756,24 @@ with tab_fmt:
                 + "  — the LLM will attempt to synthesise or infer them."
             )
 
-        if det.get("column_mappings"):
-            with st.expander("🔍  Column mappings applied"):
-                mappings_df = pd.DataFrame(
-                    det["column_mappings"].items(),
-                    columns=["Input column", "→ cBioPortal canonical"],
-                )
-                st.dataframe(mappings_df, use_container_width=True, hide_index=True)
+        col_mapped   = det.get("column_mappings", {})
+        col_unmapped = det.get("unmapped_columns", [])
+        if col_mapped or col_unmapped:
+            with st.expander("🔍  Column mappings"):
+                if col_mapped:
+                    st.markdown("**Mapped columns**")
+                    mappings_df = pd.DataFrame(
+                        col_mapped.items(),
+                        columns=["Input column", "→ cBioPortal canonical"],
+                    )
+                    st.dataframe(mappings_df, use_container_width=True, hide_index=True)
+                if col_unmapped:
+                    st.markdown("**Columns not mapped** (kept as-is or handled by LLM)")
+                    st.dataframe(
+                        pd.DataFrame(col_unmapped, columns=["Column"]),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
 
         st.divider()
         st.markdown("### Output preview")

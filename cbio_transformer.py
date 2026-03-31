@@ -13,7 +13,6 @@ learns from real curator-validated transformations at inference time.
 import os
 import io
 import re
-import json
 import glob
 import logging
 from pathlib import Path
@@ -275,9 +274,16 @@ Correct cBioPortal output for type "{cbio_type}":
 """
 
     input_preview = df.head(TRANSFORM_SAMPLE_ROWS).to_csv(sep="\t", index=False)
-    mapping_hint = ""
-    if column_mappings:
-        mapping_hint = f"\nDetected column mappings to apply:\n{json.dumps(column_mappings, indent=2)}\n"
+
+    # NOTE: column_mappings are intentionally NOT injected as a prompt hint here.
+    # The DataFrame columns are already renamed to canonical cBioPortal names by
+    # fuzzy_normalize_columns() before this function is called, so adding the
+    # mapping would be redundant and could confuse the LLM.
+    # Kept as a parameter for future use (e.g. logging, validation steps).
+    #
+    # mapping_hint = ""
+    # if column_mappings:
+    #     mapping_hint = f"\nDetected column mappings to apply:\n{json.dumps(column_mappings, indent=2)}\n"
 
     system = f"""You are a bioinformatics data curation expert specializing in cBioPortal data formats.
 Transform input data into the exact cBioPortal file format specified.
@@ -288,7 +294,6 @@ Return ONLY the correctly formatted TSV content — no explanations, no markdown
 
     user = f"""Transform the following data into cBioPortal format: {cbio_type}
 Cancer study identifier: {study_id}
-{mapping_hint}
 {f'Curator notes: {curator_notes}' if curator_notes else ''}
 
 {few_shot_block}

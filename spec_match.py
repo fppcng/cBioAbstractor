@@ -226,44 +226,50 @@ def classify_sheet(df: pd.DataFrame,
 
 
 
-def fuzzy_map_columns(
+def fuzzy_normalize_columns(
     df: pd.DataFrame,
-    spec_key: str,
-    threshold: int = 70,
-) -> dict[str, str]:
+    threshold: int = 85,
+) -> tuple[pd.DataFrame, dict[str, str]]:
     """
-    Fuzzy-match input DataFrame columns against all canonical cBioPortal field
-    names (required + optional + aliases) for the given format spec key.
+    Fuzzy-match DataFrame columns against ALL canonical cBioPortal field names
+    (required + optional + aliases, across every format spec).
 
-    Returns {input_column: canonical_cbio_column} for matches above threshold.
+    Ambiguous aliases — those that resolve to different canonical names in
+    different specs — are skipped to avoid mis-labelling columns.
+
+    Returns (df_with_renamed_columns, {original_col: canonical_col}).
     Exact alias matches are always included regardless of threshold.
-    Direction is input_col → canonical, ready to use as transformer hint.
     """
     from rapidfuzz import fuzz, process as fuzz_process
 
     specs = get_spec_or_fallback()
-    spec = next((s for s in specs if s.key == spec_key), None)
-    if not spec:
-        logger.warning("fuzzy_map_columns: spec_key '%s' not found", spec_key)
-        return {}
 
-    # Build alias → canonical reverse map (all normalized)
-    alias_to_canon: dict[str, str] = {}
-    for canon in spec.required + spec.optional:
-        alias_to_canon[_normalise(canon)] = canon
-        for alias in spec.aliases.get(canon, []):
-            alias_to_canon[_normalise(alias)] = canon
+    # Build global alias → set-of-canonicals to detect cross-spec conflicts.
+    alias_to_canonicals: dict[str, set[str]] = {}
+    for spec in specs:
+        for canon in spec.required + spec.optional:
+            alias_to_canonicals.setdefault(_normalise(canon), set()).add(canon)
+            for alias in spec.aliases.get(canon, []):
+                alias_to_canonicals.setdefault(_normalise(alias), set()).add(canon)
 
-    mappings: dict[str, str] = {}
+    # Keep only unambiguous entries (exactly one canonical across all specs).
+    alias_to_canon: dict[str, str] = {
+        alias: next(iter(canons))
+        for alias, canons in alias_to_canonicals.items()
+        if len(canons) == 1
+    }
+
+    rename_map: dict[str, str] = {}
     for input_col in df.columns:
         norm_col = _normalise(input_col)
 
         if norm_col in alias_to_canon:
-            mappings[input_col] = alias_to_canon[norm_col]
+            canonical = alias_to_canon[norm_col].upper()
+            if input_col != canonical:
+                rename_map[input_col] = canonical
             continue
 
         # Replace underscores with spaces so token_sort_ratio tokenizes correctly.
-        # e.g. "survival_months" → "survival months" matches alias "survival months"
         fuzz_col = norm_col.replace("_", " ")
         fuzz_candidates = {k.replace("_", " "): v for k, v in alias_to_canon.items()}
 
@@ -275,12 +281,16 @@ def fuzzy_map_columns(
         )
         if match:
             matched_alias, score, _ = match
-            canonical = fuzz_candidates[matched_alias]
-            mappings[input_col] = canonical
+            canonical = fuzz_candidates[matched_alias].upper()
+            rename_map[input_col] = canonical
             logger.info(
-                "fuzzy_map_columns: '%s' → '%s' via '%s' (score=%d)",
-                input_col, canonical, matched_alias, score,
+                "fuzzy_normalize_columns: '%s' → '%s' (score=%d)",
+                input_col, canonical, score,
             )
 
-    logger.info("fuzzy_map_columns: %d/%d columns mapped", len(mappings), len(df.columns))
-    return mappings
+    df_renamed = df.rename(columns=rename_map)
+    logger.info(
+        "fuzzy_normalize_columns: %d/%d columns renamed",
+        len(rename_map), len(df.columns),
+    )
+    return df_renamed, rename_map
