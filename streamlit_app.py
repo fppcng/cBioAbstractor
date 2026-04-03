@@ -1,5 +1,5 @@
 """
-cBioPortal Data Abstractor — Streamlit Application
+cBioAbstractor
 Self-contained: no backend server required.
 """
 
@@ -50,7 +50,7 @@ import pandas as pd
 # Page config
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="cBioPortal Data Abstractor",
+    page_title="cBioAbstractor",
     page_icon="🧬",
     layout="wide",
 )
