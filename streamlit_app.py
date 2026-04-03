@@ -110,8 +110,7 @@ if not _API_KEY:
 # Helper functions — defined BEFORE sidebar so they can be called there
 # ─────────────────────────────────────────────────────────────────────────────
 def _get_api_key() -> str:
-    runtime = st.session_state.get("runtime_api_key", "")
-    return runtime or _API_KEY or os.environ.get("ANTHROPIC_API_KEY", "")
+    return _API_KEY or os.environ.get("ANTHROPIC_API_KEY", "")
 
 def _require_api_key() -> bool:
     if not _get_api_key():
@@ -175,22 +174,10 @@ with st.sidebar:
     if _missing:
         st.warning("Some packages are installing. Please refresh in 1–2 minutes.")
 
-    _current_key = _get_api_key()
-    _key_input = st.text_input(
-        "Anthropic API key",
-        value=_current_key,
-        type="password",
-        key="runtime_api_key",
-        help="Enter your key once — it persists for this session.",
-    )
-    if _key_input and _key_input != _current_key:
-        _API_KEY = _key_input
-        os.environ["ANTHROPIC_API_KEY"] = _key_input
-
     if _get_api_key():
         st.success("Connected")
     else:
-        st.info("Enter your Anthropic API key above to get started.")
+        st.warning("API key not configured. Contact your administrator.")
 
     st.divider()
     st.caption("Version 1.1")
