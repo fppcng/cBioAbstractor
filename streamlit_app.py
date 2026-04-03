@@ -98,7 +98,6 @@ def _load_api_key() -> str:
 _API_KEY = _load_api_key()
 
 # ── Runtime key override (for shared/cloud deployments) ───────────────────────
-# If no key found in env/file, check Streamlit secrets (for cloud sharing)
 if not _API_KEY:
     try:
         _API_KEY = st.secrets.get("ANTHROPIC_API_KEY", "")
@@ -106,6 +105,64 @@ if not _API_KEY:
             os.environ["ANTHROPIC_API_KEY"] = _API_KEY
     except Exception:
         pass
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Helper functions — defined BEFORE sidebar so they can be called there
+# ─────────────────────────────────────────────────────────────────────────────
+def _get_api_key() -> str:
+    runtime = st.session_state.get("runtime_api_key", "")
+    return runtime or _API_KEY or os.environ.get("ANTHROPIC_API_KEY", "")
+
+def _require_api_key() -> bool:
+    if not _get_api_key():
+        st.error("⬅️ Enter your Anthropic API key in the sidebar to continue.")
+        return False
+    return True
+
+def _save_upload_to_tmp(uploaded) -> tuple[str, str]:
+    original_name = uploaded.name
+    tmp_dir = tempfile.mkdtemp()
+    path = os.path.join(tmp_dir, original_name)
+    with open(path, "wb") as f:
+        f.write(uploaded.getvalue())
+    return path, original_name
+
+def _safe_cleanup(*paths: str) -> None:
+    for p in paths:
+        try:
+            shutil.rmtree(os.path.dirname(p), ignore_errors=True)
+        except Exception:
+            pass
+
+def _call_anthropic_with_retry(client, model, system, user_content,
+                                max_tokens=2000, retries=3, backoff=5.0):
+    import anthropic
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            resp = client.messages.create(
+                model=model, max_tokens=max_tokens, system=system,
+                messages=[{"role": "user", "content": user_content}],
+            )
+            return resp.content[0].text
+        except anthropic.RateLimitError as e:
+            time.sleep(backoff * (attempt + 1)); last_exc = e
+        except anthropic.APIStatusError as e:
+            if e.status_code >= 500:
+                time.sleep(backoff * (attempt + 1)); last_exc = e
+            else:
+                raise
+        except anthropic.APIConnectionError as e:
+            time.sleep(backoff * (attempt + 1)); last_exc = e
+    raise last_exc or RuntimeError("API call failed after retries")
+
+def _parse_llm_json(raw: str) -> dict:
+    raw = re.sub(r"^```[^\n]*\n?", "", raw.strip(), flags=re.MULTILINE)
+    raw = re.sub(r"```$", "", raw, flags=re.MULTILINE).strip()
+    return json.loads(raw)
+
+def _looks_tmp(name: str) -> bool:
+    return bool(re.match(r'^tmp[a-z0-9_]{4,}', os.path.splitext(name)[0], re.I))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Sidebar
@@ -116,9 +173,8 @@ with st.sidebar:
     st.divider()
 
     if _missing:
-        st.warning("Some packages are installing. The app will be ready shortly — please refresh in 1–2 minutes.")
+        st.warning("Some packages are installing. Please refresh in 1–2 minutes.")
 
-    # Always show key input — pre-filled if already configured
     _current_key = _get_api_key()
     _key_input = st.text_input(
         "Anthropic API key",
@@ -160,86 +216,8 @@ tab_curate, tab_detect, tab_transform, tab_examples = st.tabs([
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Shared helpers
+# Colour helpers for the report table
 # ─────────────────────────────────────────────────────────────────────────────
-def _get_api_key() -> str:
-    # Check runtime input first (updated during session)
-    runtime = st.session_state.get("runtime_api_key", "")
-    return runtime or _API_KEY or os.environ.get("ANTHROPIC_API_KEY", "")
-
-def _require_api_key() -> bool:
-    if not _get_api_key():
-        st.error("API key not configured. Enter your Anthropic key in the sidebar.")
-        return False
-    return True
-
-def _save_upload_to_tmp(uploaded) -> tuple[str, str]:
-    """Save UploadedFile to a temp dir, returning (path, original_name)."""
-    original_name = uploaded.name
-    tmp_dir = tempfile.mkdtemp()
-    path = os.path.join(tmp_dir, original_name)
-    with open(path, "wb") as f:
-        f.write(uploaded.getvalue())
-    return path, original_name
-
-def _safe_cleanup(*paths: str) -> None:
-    """Remove temp dirs created by _save_upload_to_tmp."""
-    for p in paths:
-        try:
-            shutil.rmtree(os.path.dirname(p), ignore_errors=True)
-        except Exception:
-            pass
-
-def _call_anthropic_with_retry(
-    client,
-    model: str,
-    system: str,
-    user_content: str,
-    max_tokens: int = 2000,
-    retries: int = 3,
-    backoff: float = 5.0,
-) -> str:
-    """Call Anthropic API with automatic retry on transient errors."""
-    import anthropic
-    last_exc: Optional[Exception] = None
-    for attempt in range(retries):
-        try:
-            resp = client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                system=system,
-                messages=[{"role": "user", "content": user_content}],
-            )
-            return resp.content[0].text
-        except anthropic.RateLimitError as e:
-            wait = backoff * (attempt + 1)
-            logger.warning("Rate limit hit, retrying in %ss", wait)
-            time.sleep(wait)
-            last_exc = e
-        except anthropic.APIStatusError as e:
-            if e.status_code >= 500:
-                wait = backoff * (attempt + 1)
-                logger.warning("Server error %s, retrying in %ss", e.status_code, wait)
-                time.sleep(wait)
-                last_exc = e
-            else:
-                raise  # 4xx errors are not retryable
-        except anthropic.APIConnectionError as e:
-            wait = backoff * (attempt + 1)
-            logger.warning("Connection error, retrying in %ss", wait)
-            time.sleep(wait)
-            last_exc = e
-    raise last_exc or RuntimeError("API call failed after retries")
-
-def _parse_llm_json(raw: str) -> dict:
-    """Strip markdown fences and parse JSON from LLM response."""
-    raw = re.sub(r"^```[^\n]*\n?", "", raw.strip(), flags=re.MULTILINE)
-    raw = re.sub(r"```$", "", raw, flags=re.MULTILINE).strip()
-    return json.loads(raw)
-
-def _looks_tmp(name: str) -> bool:
-    """Return True if filename looks like an OS temp name."""
-    return bool(re.match(r'^tmp[a-z0-9_]{4,}', os.path.splitext(name)[0], re.I))
 
 def _colour_curability(val):
     return {
