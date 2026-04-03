@@ -1,5 +1,5 @@
 """
-cBioAbstractor — Streamlit Application
+cBioPortal Data Abstractor — Streamlit Application
 Self-contained: no backend server required.
 """
 
@@ -7,13 +7,23 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import sys
 import json
+import time
+import shutil
 import tempfile
 import traceback
 import importlib
+import importlib.util
+import logging
+from pathlib import Path
+from typing import Optional
 
 import streamlit as st
+
+logging.basicConfig(level=logging.WARNING)
+logger = logging.getLogger(__name__)
 
 # ── Path setup ────────────────────────────────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -40,7 +50,7 @@ import pandas as pd
 # Page config
 # ─────────────────────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="cBioAbstractor",
+    page_title="cBioPortal Data Abstractor",
     page_icon="🧬",
     layout="wide",
 )
@@ -87,33 +97,52 @@ def _load_api_key() -> str:
 
 _API_KEY = _load_api_key()
 
+# ── Runtime key override (for shared/cloud deployments) ───────────────────────
+# If no key found in env/file, check Streamlit secrets (for cloud sharing)
+if not _API_KEY:
+    try:
+        _API_KEY = st.secrets.get("ANTHROPIC_API_KEY", "")
+        if _API_KEY:
+            os.environ["ANTHROPIC_API_KEY"] = _API_KEY
+    except Exception:
+        pass
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Sidebar
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.title("cBioAbstractor")
+    st.title("cBioPortal Data Abstractor")
     st.caption("Automated curation support for cancer genomics studies.")
     st.divider()
 
     if _missing:
-        st.error("Missing packages. Run:")
-        st.code("pip install " + " ".join(_missing))
+        st.warning("Some packages are installing. The app will be ready shortly — please refresh in 1–2 minutes.")
 
-    if _API_KEY:
+    # Always show key input — pre-filled if already configured
+    _current_key = _get_api_key()
+    _key_input = st.text_input(
+        "Anthropic API key",
+        value=_current_key,
+        type="password",
+        key="runtime_api_key",
+        help="Enter your key once — it persists for this session.",
+    )
+    if _key_input and _key_input != _current_key:
+        _API_KEY = _key_input
+        os.environ["ANTHROPIC_API_KEY"] = _key_input
+
+    if _get_api_key():
         st.success("Connected")
     else:
-        st.error(
-            "API key not found. Create an **api_config.py** file:\n"
-            "```python\nANTHROPIC_API_KEY = \"sk-ant-...\"\n```"
-        )
+        st.info("Enter your Anthropic API key above to get started.")
 
     st.divider()
-    st.caption("Version 1.0")
+    st.caption("Version 1.1")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Header
 # ─────────────────────────────────────────────────────────────────────────────
-st.title("cBioAbstractor")
+st.title("cBioPortal Data Abstractor")
 st.markdown(
     "Upload a published cancer genomics paper and its supplementary data files "
     "to generate a structured curation summary for cBioPortal ingestion."
@@ -134,29 +163,83 @@ tab_curate, tab_detect, tab_transform, tab_examples = st.tabs([
 # Shared helpers
 # ─────────────────────────────────────────────────────────────────────────────
 def _get_api_key() -> str:
-    return _API_KEY
+    # Check runtime input first (updated during session)
+    runtime = st.session_state.get("runtime_api_key", "")
+    return runtime or _API_KEY or os.environ.get("ANTHROPIC_API_KEY", "")
 
 def _require_api_key() -> bool:
-    if not _API_KEY:
-        st.error(
-            "API key not configured. Add your Anthropic key to **api_config.py**."
-        )
+    if not _get_api_key():
+        st.error("API key not configured. Enter your Anthropic key in the sidebar.")
         return False
     return True
 
 def _save_upload_to_tmp(uploaded) -> tuple[str, str]:
-    """Save an UploadedFile to a temp directory.
-    Returns (temp_path, original_name) where original_name is always the
-    browser-supplied filename from the file picker dialog.
-    """
-    # Streamlit's .name is the original filename as selected by the user
+    """Save UploadedFile to a temp dir, returning (path, original_name)."""
     original_name = uploaded.name
     tmp_dir = tempfile.mkdtemp()
-    # Save using the original name so Path(path).name == original_name
     path = os.path.join(tmp_dir, original_name)
     with open(path, "wb") as f:
         f.write(uploaded.getvalue())
     return path, original_name
+
+def _safe_cleanup(*paths: str) -> None:
+    """Remove temp dirs created by _save_upload_to_tmp."""
+    for p in paths:
+        try:
+            shutil.rmtree(os.path.dirname(p), ignore_errors=True)
+        except Exception:
+            pass
+
+def _call_anthropic_with_retry(
+    client,
+    model: str,
+    system: str,
+    user_content: str,
+    max_tokens: int = 2000,
+    retries: int = 3,
+    backoff: float = 5.0,
+) -> str:
+    """Call Anthropic API with automatic retry on transient errors."""
+    import anthropic
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            resp = client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": user_content}],
+            )
+            return resp.content[0].text
+        except anthropic.RateLimitError as e:
+            wait = backoff * (attempt + 1)
+            logger.warning("Rate limit hit, retrying in %ss", wait)
+            time.sleep(wait)
+            last_exc = e
+        except anthropic.APIStatusError as e:
+            if e.status_code >= 500:
+                wait = backoff * (attempt + 1)
+                logger.warning("Server error %s, retrying in %ss", e.status_code, wait)
+                time.sleep(wait)
+                last_exc = e
+            else:
+                raise  # 4xx errors are not retryable
+        except anthropic.APIConnectionError as e:
+            wait = backoff * (attempt + 1)
+            logger.warning("Connection error, retrying in %ss", wait)
+            time.sleep(wait)
+            last_exc = e
+    raise last_exc or RuntimeError("API call failed after retries")
+
+def _parse_llm_json(raw: str) -> dict:
+    """Strip markdown fences and parse JSON from LLM response."""
+    raw = re.sub(r"^```[^\n]*\n?", "", raw.strip(), flags=re.MULTILINE)
+    raw = re.sub(r"```$", "", raw, flags=re.MULTILINE).strip()
+    return json.loads(raw)
+
+def _looks_tmp(name: str) -> bool:
+    """Return True if filename looks like an OS temp name."""
+    return bool(re.match(r'^tmp[a-z0-9_]{4,}', os.path.splitext(name)[0], re.I))
 
 def _colour_curability(val):
     return {
@@ -455,99 +538,85 @@ with tab_curate:
         if not _require_api_key():
             st.stop()
 
-        with st.spinner("Saving uploaded files..."):
-            pdf_tmp, _pdf_name = _save_upload_to_tmp(paper_pdf)
-            supp_list = list(supp_files or [])
-
-            # Read names from session_state — these were saved when the user
-            # saw the File Names section, and survive the button re-run.
-            n = st.session_state.get("fname_count", len(supp_list))
-            orig_names = [
-                st.session_state.get(f"fname_{i}",
-                    f"Supplementary_Data_{i+1}.xlsx")
-                for i in range(n)
-            ]
-            # Trim/pad to match actual number of uploaded files
-            orig_names = orig_names[:len(supp_list)]
-            while len(orig_names) < len(supp_list):
-                orig_names.append(f"Supplementary_Data_{len(orig_names)+1}.xlsx")
-
-            # Save each file using the confirmed original name
-            supp_tmps = []
-            for sf, orig in zip(supp_list, orig_names):
-                tmp_dir = tempfile.mkdtemp()
-                dest    = os.path.join(tmp_dir, orig)
-                with open(dest, "wb") as fh:
-                    fh.write(sf.getvalue())
-                supp_tmps.append(dest)
-
+        # ── Save uploads ──────────────────────────────────────────────────────
+        pdf_tmp    = None
+        supp_tmps: list[str] = []
         try:
+            with st.spinner("Saving uploaded files..."):
+                pdf_tmp, _ = _save_upload_to_tmp(paper_pdf)
+                supp_list  = list(supp_files or [])
+
+                # Read names from session_state (survive button re-run)
+                n = st.session_state.get("fname_count", len(supp_list))
+                orig_names = [
+                    st.session_state.get(f"fname_{i}", f"Supplementary_Data_{i+1}.xlsx")
+                    for i in range(n)
+                ]
+                orig_names = orig_names[:len(supp_list)]
+                while len(orig_names) < len(supp_list):
+                    orig_names.append(f"Supplementary_Data_{len(orig_names)+1}.xlsx")
+
+                for sf, orig in zip(supp_list, orig_names):
+                    tmp_dir = tempfile.mkdtemp()
+                    dest    = os.path.join(tmp_dir, orig)
+                    with open(dest, "wb") as fh:
+                        fh.write(sf.getvalue())
+                    supp_tmps.append(dest)
+
             use_anthropic   = llm_model.startswith("anthropic/")
             anthropic_model = llm_model.split("/", 1)[1] if use_anthropic else None
 
-            with st.spinner("Extracting study metadata and classifying files. This may take 1–3 minutes..."):
+            # ── Step 1: Extract metadata ──────────────────────────────────────
+            meta: dict = {}
+            with st.spinner("Step 1 of 2 — Extracting study metadata from PDF..."):
                 if use_anthropic:
-                    import re as _re
                     import anthropic as _anthropic
-                    from cbioportal_curator import (
-                        _extract_pdf_text,
-                        _analyse_supplementary_files,
-                        SYSTEM_PROMPT_CURATOR,
-                    )
+                    from cbioportal_curator import _extract_pdf_text, SYSTEM_PROMPT_CURATOR
 
-                    pdf_text  = _extract_pdf_text(pdf_tmp)
-                    _client   = _anthropic.Anthropic(api_key=_get_api_key())
-                    _resp     = _client.messages.create(
-                        model=anthropic_model,
-                        max_tokens=2000,
-                        system=SYSTEM_PROMPT_CURATOR,
-                        messages=[{"role": "user", "content": pdf_text[:40000]}],
-                    )
-                    raw_meta = _resp.content[0].text.strip()
-                    raw_meta = _re.sub(r"^```[^\n]*\n?", "", raw_meta, flags=_re.MULTILINE)
-                    raw_meta = _re.sub(r"```$",          "", raw_meta, flags=_re.MULTILINE).strip()
-                    meta    = json.loads(raw_meta)
+                    pdf_text = _extract_pdf_text(pdf_tmp)
+                    if not pdf_text.strip():
+                        st.warning("Could not extract text from the PDF. Metadata fields will be blank.")
+                    else:
+                        _client = _anthropic.Anthropic(api_key=_get_api_key())
+                        try:
+                            raw_meta = _call_anthropic_with_retry(
+                                _client,
+                                model=anthropic_model,
+                                system=SYSTEM_PROMPT_CURATOR,
+                                user_content=pdf_text[:40000],
+                                max_tokens=2000,
+                            )
+                            meta = _parse_llm_json(raw_meta)
+                        except json.JSONDecodeError:
+                            st.warning("Metadata extraction returned unexpected format. Continuing with file classification.")
+                            meta = {}
+                        except Exception as e:
+                            st.warning(f"Metadata extraction failed ({e}). Continuing with file classification.")
+                            meta = {}
 
-                    # Since each file is already saved as its original name,
-                    # Path(path).name inside the curator returns the real filename.
-                    records = _analyse_supplementary_files(supp_tmps)
+            # ── Step 2: Classify supplementary files ─────────────────────────
+            records: list[dict] = []
+            with st.spinner(f"Step 2 of 2 — Classifying {len(supp_tmps)} supplementary file(s)..."):
+                if use_anthropic:
+                    from cbioportal_curator import _analyse_supplementary_files
 
-                    # Positional patch — guarantee original names regardless of
-                    # what the curator stored. Group records by the file key they
-                    # contain, then overwrite in upload order.
+                    try:
+                        records = _analyse_supplementary_files(supp_tmps)
+                    except Exception as e:
+                        st.error(f"File classification failed: {e}")
+                        with st.expander("Error details"):
+                            st.code(traceback.format_exc())
+                        st.stop()
+
+                    # Positional filename patch
                     _by_file: dict[str, list] = {}
                     for rec in records:
                         _by_file.setdefault(rec.get("file", ""), []).append(rec)
-
                     for i, orig in enumerate(orig_names):
-                        file_key = list(_by_file.keys())[i] if i < len(_by_file) else None
-                        if file_key and file_key != orig:
-                            for rec in _by_file[file_key]:
+                        key = list(_by_file.keys())[i] if i < len(_by_file) else None
+                        if key and key != orig:
+                            for rec in _by_file[key]:
                                 rec["file"] = orig
-
-                    summary = {
-                        "study_id":         meta.get("study_id_suggestion"),
-                        "cancer_type":      meta.get("cancer_type"),
-                        "num_samples":      meta.get("num_samples"),
-                        "reference_genome": meta.get("reference_genome"),
-                        "files_analysed":   len(supp_tmps),
-                        "sheets_analysed":  len(records),
-                        "high_priority":    sum(1 for r in records if r.get("priority") == "HIGH"),
-                        "medium_priority":  sum(1 for r in records if r.get("priority") == "MEDIUM"),
-                        "not_loadable":     sum(1 for r in records if r.get("curability") == "NO"),
-                        "file_breakdown": [{
-                            "file":        r["file"],
-                            "sheet":       r["sheet"],
-                            "cbio_format": r["cbio_target_file"],
-                            "curability":  r["curability"],
-                            "priority":    r["priority"],
-                            "confidence":  r.get("confidence", 0),
-                            "verdict":     r.get("verdict", ""),
-                            "req_present": r.get("required_present", []),
-                            "req_missing": r.get("required_missing", []),
-                            "opt_present": r.get("optional_present", []),
-                        } for r in records],
-                    }
 
                 else:
                     from cbioportal_curator import curate
@@ -555,9 +624,35 @@ with tab_curate:
                         pdf_path=pdf_tmp, supp_paths=supp_tmps,
                         llm_model=llm_model, temperature=temperature,
                     )
-                    meta    = {}   # not separately returned by curate()
-                    summary = result["summary"]
+                    meta    = meta or {}
                     records = []
+                    summary = result["summary"]
+
+            # ── Build summary ─────────────────────────────────────────────────
+            if use_anthropic:
+                summary = {
+                    "study_id":         meta.get("study_id_suggestion") or "—",
+                    "cancer_type":      meta.get("cancer_type") or "—",
+                    "num_samples":      meta.get("num_samples") or "—",
+                    "reference_genome": meta.get("reference_genome") or "—",
+                    "files_analysed":   len(supp_tmps),
+                    "sheets_analysed":  len(records),
+                    "high_priority":    sum(1 for r in records if r.get("priority") == "HIGH"),
+                    "medium_priority":  sum(1 for r in records if r.get("priority") == "MEDIUM"),
+                    "not_loadable":     sum(1 for r in records if r.get("curability") == "NO"),
+                    "file_breakdown": [{
+                        "file":        r["file"],
+                        "sheet":       r["sheet"],
+                        "cbio_format": r.get("cbio_target_file", "—"),
+                        "curability":  r.get("curability", "NO"),
+                        "priority":    r.get("priority", "N/A"),
+                        "confidence":  r.get("confidence", 0),
+                        "verdict":     r.get("verdict", ""),
+                        "req_present": r.get("required_present", []),
+                        "req_missing": r.get("required_missing", []),
+                        "opt_present": r.get("optional_present", []),
+                    } for r in records],
+                }
 
         except Exception as exc:
             st.error(f"Curation failed: {exc}")
@@ -565,13 +660,7 @@ with tab_curate:
                 st.code(traceback.format_exc())
             st.stop()
         finally:
-            try:
-                import shutil
-                shutil.rmtree(os.path.dirname(pdf_tmp), ignore_errors=True)
-                for p in supp_tmps:
-                    shutil.rmtree(os.path.dirname(p), ignore_errors=True)
-            except Exception:
-                pass
+            _safe_cleanup(pdf_tmp or "", *supp_tmps)
 
         st.success("Curation complete.")
         st.divider()
