@@ -167,7 +167,10 @@ def _looks_tmp(name: str) -> bool:
 # Sidebar
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
-    st.title("cBioPortal Data Abstractor")
+    st.image(
+        "https://raw.githubusercontent.com/cBioPortal/cbioportal/master/src/main/resources/static/images/cbioportal_logo.png",
+        use_container_width=True,
+    )
     st.caption("Automated curation support for cancer genomics studies.")
     st.divider()
 
@@ -185,20 +188,25 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────────────────────
 # Header
 # ─────────────────────────────────────────────────────────────────────────────
-st.title("cBioPortal Data Abstractor")
-st.markdown(
-    "Upload a published cancer genomics paper and its supplementary data files "
-    "to generate a structured curation summary for cBioPortal ingestion."
-)
+col_logo, col_title = st.columns([1, 4])
+with col_logo:
+    st.image(
+        "https://raw.githubusercontent.com/cBioPortal/cbioportal/master/src/main/resources/static/images/cbioportal_logo.png",
+        width=160,
+    )
+with col_title:
+    st.title("Data Abstractor")
+    st.markdown(
+        "Upload a published cancer genomics paper and its supplementary data files "
+        "to generate a structured curation summary for cBioPortal ingestion."
+    )
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Tabs
 # ─────────────────────────────────────────────────────────────────────────────
-tab_curate, tab_detect, tab_transform, tab_examples = st.tabs([
+tab_curate, tab_detect = st.tabs([
     "Curation Report",
     "File Classification",
-    "Format Converter",
-    "Training Examples",
 ])
 
 
@@ -712,199 +720,3 @@ with tab_detect:
                                  use_container_width=True, hide_index=True)
         except Exception:
             pass
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# TAB 3 — Format Converter
-# ═════════════════════════════════════════════════════════════════════════════
-with tab_transform:
-    st.subheader("Format Converter")
-    st.markdown(
-        "Upload a raw supplementary data file, select the target cBioPortal "
-        "format, and the tool will reformat it to meet cBioPortal requirements — "
-        "including the correct header structure and a matching metadata file."
-    )
-
-    if not _get_api_key():
-        st.info("An API key is required to use the format converter.")
-
-    trans_file = st.file_uploader(
-        "Select file to convert",
-        type=["xlsx", "xls", "csv", "tsv", "txt", "maf"],
-        key="transform_file",
-    )
-
-    tr1, tr2 = st.columns(2)
-    with tr1:
-        from config import CBIO_FORMAT_IDS
-        cbio_type = st.selectbox(
-            "Target format",
-            options=CBIO_FORMAT_IDS,
-            key="transform_type",
-        )
-        study_id = st.text_input(
-            "Study identifier",
-            value="my_study_2025",
-            key="transform_study_id",
-            help="Used in the meta file. Typically lowercase with underscores, e.g. gist_smith_2024.",
-        )
-    with tr2:
-        curator_notes = st.text_area(
-            "Notes for the converter (optional)",
-            placeholder="Example: OS_MONTHS values are in days — divide by 30.44",
-            height=110,
-            key="transform_notes",
-        )
-
-    if st.button(
-        "Convert File",
-        disabled=(trans_file is None),
-        type="primary",
-        key="transform_btn",
-    ):
-        if not _require_api_key():
-            st.stop()
-
-        from file_parser import parse_file
-        from cbio_transformer import transform_to_cbio
-
-        with st.spinner("Reading file..."):
-            try:
-                df = parse_file(trans_file.getvalue(), trans_file.name)
-            except Exception as exc:
-                st.error(f"Could not read file: {exc}")
-                st.stop()
-
-        st.markdown("#### Input Preview")
-        st.dataframe(df.head(8), use_container_width=True)
-
-        with st.spinner("Converting to cBioPortal format..."):
-            try:
-                result = transform_to_cbio(
-                    df=df,
-                    cbio_type=cbio_type,
-                    study_id=study_id,
-                    curator_notes=curator_notes,
-                    anthropic_api_key=_get_api_key(),
-                )
-            except Exception as exc:
-                st.error(f"Conversion failed: {exc}")
-                with st.expander("Error details"):
-                    st.code(traceback.format_exc())
-                st.stop()
-
-        st.success("Conversion complete.")
-        st.divider()
-
-        out1, out2 = st.columns(2)
-
-        with out1:
-            st.markdown(f"#### Data File — `{result['data_filename']}`")
-            try:
-                lines = result["data_content"].splitlines()
-                data_lines = [l for l in lines if not l.startswith("#")]
-                preview_df = pd.read_csv(
-                    io.StringIO("\n".join(data_lines)),
-                    sep="\t", dtype=str, engine="python",
-                )
-                st.dataframe(preview_df.head(15), use_container_width=True)
-            except Exception:
-                st.text(result["data_content"][:2000])
-
-            st.download_button(
-                f"Download {result['data_filename']}",
-                data=result["data_content"].encode("utf-8"),
-                file_name=result["data_filename"],
-                mime="text/plain",
-            )
-
-        with out2:
-            st.markdown(f"#### Metadata File — `{result['meta_filename']}`")
-            st.code(result["meta_content"], language="yaml")
-            st.download_button(
-                f"Download {result['meta_filename']}",
-                data=result["meta_content"].encode("utf-8"),
-                file_name=result["meta_filename"],
-                mime="text/plain",
-            )
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# TAB 4 — Training Examples
-# ═════════════════════════════════════════════════════════════════════════════
-with tab_examples:
-    st.subheader("Training Examples")
-    st.markdown(
-        "Save verified input/output file pairs to improve classification and "
-        "conversion accuracy over time. Each saved example is automatically "
-        "used as a reference on future runs."
-    )
-
-    try:
-        from few_shot_manager import list_examples, save_example, delete_example
-
-        examples = list_examples()
-        if examples:
-            st.markdown(f"**{len(examples)} example(s) saved**")
-            ex_df = pd.DataFrame([{
-                "ID":          e["id"],
-                "Format":      e["type"],
-                "Description": e["description"],
-                "Saved":       e["created_at"][:19].replace("T", " ") if e["created_at"] else "",
-                "Input":       "Yes" if e["has_input"]  else "No",
-                "Output":      "Yes" if e["has_output"] else "No",
-            } for e in examples])
-            st.dataframe(ex_df, use_container_width=True, hide_index=True)
-
-            del_id = st.selectbox(
-                "Remove an example",
-                options=["— select —"] + [e["id"] for e in examples],
-                key="del_example_id",
-            )
-            if st.button("Remove Selected Example", key="del_example_btn"):
-                if del_id != "— select —":
-                    if delete_example(del_id):
-                        st.success(f"Example {del_id} removed.")
-                        st.rerun()
-                    else:
-                        st.error("Could not remove example.")
-        else:
-            st.info("No training examples saved yet.")
-
-        st.divider()
-        st.markdown("#### Add New Example")
-
-        from config import CBIO_FORMAT_IDS as _FIDS
-        ex_type = st.selectbox("cBioPortal format", _FIDS, key="new_ex_type")
-        ex_desc = st.text_input("Description (optional)", key="new_ex_desc")
-
-        ec1, ec2 = st.columns(2)
-        with ec1:
-            st.markdown("**Input file** (raw supplementary data)")
-            input_upload = st.file_uploader(
-                "Select input file (.tsv or .csv)",
-                type=["tsv", "txt", "csv"], key="new_ex_input",
-            )
-        with ec2:
-            st.markdown("**Output file** (correctly formatted cBioPortal file)")
-            output_upload = st.file_uploader(
-                "Select output file (.tsv or .txt)",
-                type=["tsv", "txt"], key="new_ex_output",
-            )
-
-        if st.button("Save Example", key="save_ex_btn"):
-            if not input_upload or not output_upload:
-                st.warning("Please provide both an input and an output file.")
-            else:
-                eid = save_example(
-                    input_tsv=input_upload.getvalue().decode("utf-8", errors="replace"),
-                    output_tsv=output_upload.getvalue().decode("utf-8", errors="replace"),
-                    cbio_type=ex_type,
-                    description=ex_desc,
-                )
-                st.success(f"Example {eid} saved for format: {ex_type}.")
-                st.rerun()
-
-    except Exception as _e:
-        st.error(f"Training example manager unavailable: {_e}")
-        st.code(traceback.format_exc())
