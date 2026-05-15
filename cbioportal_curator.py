@@ -37,14 +37,6 @@ from docx.enum.table import WD_TABLE_ALIGNMENT
 from docx.oxml.ns import qn
 from docx.oxml import OxmlElement
 
-from utils import load_chat_model
-try:
-    from langchain_core.messages import HumanMessage, SystemMessage
-except ImportError:
-    # langchain not installed — _extract_metadata_llm will be bypassed
-    # by streamlit_app_new.py which calls the Anthropic SDK directly.
-    HumanMessage = None
-    SystemMessage = None
 from spec_match import classify_sheet, ClassificationResult
 from cbioportal_spec import SPEC_BY_KEY
 
