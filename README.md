@@ -1,109 +1,170 @@
-# Synopsis — Local Setup & Deployment Guide
+# cBioAbstractor
 
-## Files in this bundle
-
-| File | Purpose |
-|------|---------|
-| `query.py` | FastAPI backend — all API endpoints |
-| `app.py` | Uvicorn entry point (`python app.py`) |
-| `streamlit_app.py` | Streamlit 3-tab UI |
-| `cbioportal_curator.py` | Core curation engine |
-| `cbioportal_spec.py` | Embedded cBioPortal format schemas |
-| `spec_fetcher.py` | Live GitHub spec fetcher (cached 1 hr) |
-| `spec_match.py` | Spec-driven sheet classifier |
-| `gene_alteration_analyst.py` | Alteration frequency + LLM code interpreter |
-| `utils.py` | `load_chat_model()` router (OpenAI / Bedrock) |
-| `pdf_ingest.py` | PDF → LangChain document chunks |
-| `vector_store.py` | ChromaDB vector store helpers |
-| `system_prompt_config.py` | Named system prompt registry |
-| `config.py` | All environment / path constants |
-| `cbio_detector.py` | Heuristic + LLM sheet type detector |
-| `cbio_transformer.py` | LLM-powered format transformer |
-| `few_shot_manager.py` | Save / list / delete few-shot examples |
-| `file_parser.py` | Parse any uploaded file to DataFrame |
-| `gene_extract.py` | Gene name extraction from text |
-| `requirements.txt` | Python dependencies |
+cBioAbstractor is a Streamlit-based curation assistant for cancer genomics studies. It helps curators review a published paper and its supplementary files, classify the data against cBioPortal file formats, and generate a structured curation report for downstream cBioPortal ingestion.
 
 ---
 
-## 1. First-time setup
+## Features
+
+- Upload a cancer genomics paper PDF
+- Upload supplementary data files such as `.xlsx`, `.csv`, `.tsv`, `.txt`, `.maf`, `.docx`, and `.pdf`
+- Extract study-level metadata from the paper
+- Classify supplementary sheets against cBioPortal file-format schemas
+- Identify likely cBioPortal target files
+- Highlight required columns, missing fields, and curation gaps
+- Generate a downloadable `.docx` curation report
+- Support few-shot examples for curator-guided learning
+
+---
+
+## Streamlit App
+
+This repository is designed to run as a simple local Streamlit app.
+
+No Docker setup is required.
+
+No FastAPI backend is required.
+
+---
+
+## Recommended Project Structure
+
+```text
+cBioAbstractor/
+├── streamlit_app.py
+├── cbioportal_curator.py
+├── cbio_detector.py
+├── cbio_transformer.py
+├── cbioportal_spec.py
+├── spec_match.py
+├── spec_fetcher.py
+├── file_parser.py
+├── few_shot_manager.py
+├── config.py
+├── utils.py
+├── requirements.txt
+└── few_shot_examples/
+```
+
+---
+
+## Installation
+
+Clone the repository:
 
 ```bash
-# Navigate to the project folder
-cd ~/Downloads/synapse_cbio/
+git clone git@github.com:sbabyanusha/cBioAbstractor.git
+cd cBioAbstractor
+```
 
-# Activate your Python 3.9 environment
-pyenv local 3.9.18
+Create and activate a virtual environment:
 
-# Install dependencies
+```bash
+python -m venv .venv
+source .venv/bin/activate
+```
+
+Install dependencies:
+
+```bash
 pip install -r requirements.txt
 ```
 
 ---
 
-## 2. Set your API key
+## API Key Setup
+
+Set your Anthropic API key locally as an environment variable:
 
 ```bash
-export OPENAI_API_KEY="sk-..."
+export ANTHROPIC_API_KEY="your-api-key"
 ```
 
-Or create a `.env` file:
-```
-OPENAI_API_KEY=sk-...
+Do not commit API keys to GitHub.
+
+Recommended `.gitignore` entries:
+
+```text
+.env
+api_config.py
+__pycache__/
+*.pyc
+.venv/
+vector_store/
 ```
 
 ---
 
-## 3. Run locally
+## Run the App
 
-**Terminal 1 — Backend:**
 ```bash
-cd ~/Downloads/synapse_cbio/
-python app.py
-# Backend available at http://localhost:8000
-# API docs at http://localhost:8000/docs
-```
-
-**Terminal 2 — Frontend:**
-```bash
-cd ~/Downloads/synapse_cbio/
 streamlit run streamlit_app.py
-# UI available at http://localhost:8501
+```
+
+The app will open at:
+
+```text
+http://localhost:8501
 ```
 
 ---
 
-## 4. Verify the backend is working
+## How to Use
 
-```bash
-curl http://localhost:8000/
-# → {"status":"ok","service":"Synopsis backend","version":"3.1.0"}
+1. Open the Streamlit app
+2. Upload the main paper PDF
+3. Upload one or more supplementary files
+4. Run the curation workflow
+5. Review detected file types, required fields, and missing fields
+6. Download the generated cBioPortal curation report
 
-curl http://localhost:8000/spec_status
-# → {"source":"live","num_formats":13,...}
+---
+
+## Core Modules
+
+| File | Purpose |
+|---|---|
+| `streamlit_app.py` | Main Streamlit user interface |
+| `cbioportal_curator.py` | Core report-generation engine |
+| `cbio_detector.py` | Detects likely cBioPortal file type |
+| `cbio_transformer.py` | Helps transform raw files toward cBioPortal format |
+| `cbioportal_spec.py` | Embedded cBioPortal file-format schemas |
+| `spec_match.py` | Matches uploaded files against cBioPortal schemas |
+| `spec_fetcher.py` | Fetches live cBioPortal file-format documentation |
+| `file_parser.py` | Parses uploaded CSV, TSV, Excel, and text files |
+| `few_shot_manager.py` | Saves curator-approved examples |
+| `config.py` | Central configuration |
+| `utils.py` | Shared helper functions |
+
+---
+
+## Few-Shot Examples
+
+Curators can save reviewed examples to improve future file detection and transformation.
+
+Examples are stored in:
+
+```text
+few_shot_examples/
 ```
 
----
+Each example may include:
 
-## 5. Deploy to Render (free tier)
+```text
+001.input.tsv
+001.output.tsv
+001.type.txt
+001.meta.json
+```
 
-1. Push all files to a GitHub repository
-2. Create a new **Web Service** on render.com pointing to the repo
-3. Set:
-   - **Build command:** `pip install -r requirements.txt`
-   - **Start command:** `uvicorn query:app --host 0.0.0.0 --port $PORT`
-   - **Environment variable:** `OPENAI_API_KEY = sk-...`
-4. After deploy, change `API_URL` in `streamlit_app.py` from `http://localhost:8000`
-   to your Render URL (e.g. `https://gene-backend.onrender.com`)
+These examples help the app recognize recurring supplemental file patterns.
 
 ---
 
-## 6. Troubleshooting
+## What This Tool Does
 
-| Error | Fix |
-|-------|-----|
-| `ModuleNotFoundError` | Run `pip install -r requirements.txt` again |
-| `OpenAIError: api_key must be set` | `export OPENAI_API_KEY="sk-..."` |
-| `Address already in use` | `lsof -ti:8000 \| xargs kill -9` |
-| Port 8501 already in use | `lsof -ti:8501 \| xargs kill -9` |
-| Streamlit can't reach backend | Make sure `python app.py` is running in another terminal |
+- Publication review
+- Supplementary file classification
+- cBioPortal format assessment
+- Curation report generation
+
