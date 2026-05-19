@@ -396,6 +396,9 @@ with tab_curate:
                 "claude-sonnet-4-20250514",
                 "claude-3-5-haiku-20241022",
                 "claude-3-5-sonnet-20241022",
+                "claude-sonnet-4-6",            # latest Sonnet — recommended default
+                "claude-opus-4-6",              # most capable, slower/more expensive
+                "claude-haiku-4-5-20251001",    # fastest/cheapest
             ],
             index=0,
         )
