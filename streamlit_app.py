@@ -7,12 +7,14 @@ This cleaned version keeps only:
   2. File Classification
 
 It removes merge-conflict markers, Docker/backend assumptions, and api_config.py usage.
-Set ANTHROPIC_API_KEY as an environment variable or Streamlit secret.
+Set ANTHROPIC_API_KEY or OPENAI_API_KEY as an environment variable, .env value,
+or Streamlit secret.
 """
 
 from __future__ import annotations
 
 import json
+import io
 import os
 import re
 import shutil
@@ -20,6 +22,7 @@ import sys
 import tempfile
 import time
 import traceback
+import zipfile
 from typing import Any
 
 import pandas as pd
@@ -147,6 +150,52 @@ def _safe_cleanup(*paths: str) -> None:
             shutil.rmtree(os.path.dirname(path), ignore_errors=True)
         except Exception:
             pass
+
+
+def _clear_pmc_download_state() -> None:
+    tmp_dir = st.session_state.get("pmc_download_tmp_dir")
+    if tmp_dir:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    for key in [
+        "pmc_download_tmp_dir",
+        "pmc_download_pmcid",
+        "pmc_download_identifier",
+        "pmc_download_identifier_type",
+        "pmc_downloaded_files",
+    ]:
+        st.session_state.pop(key, None)
+
+
+def _build_download_zip(files: list[dict[str, str]]) -> bytes:
+    buffer = io.BytesIO()
+    used_names: set[str] = set()
+    with zipfile.ZipFile(buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for item in files:
+            path = item.get("path", "")
+            filename = item.get("filename") or os.path.basename(path)
+            if not path or not os.path.exists(path):
+                continue
+
+            safe_name = os.path.basename(filename)
+            if safe_name in used_names:
+                stem, ext = os.path.splitext(safe_name)
+                suffix = 2
+                while f"{stem}_{suffix}{ext}" in used_names:
+                    suffix += 1
+                safe_name = f"{stem}_{suffix}{ext}"
+            used_names.add(safe_name)
+            archive.write(path, arcname=safe_name)
+
+    return buffer.getvalue()
+
+
+def _detect_pubmed_identifier_type(identifier: str) -> str | None:
+    value = identifier.strip()
+    if re.fullmatch(r"PMC\d+", value, flags=re.IGNORECASE):
+        return "PMCID"
+    if re.fullmatch(r"\d+", value):
+        return "PMID"
+    return None
 
 
 def _call_anthropic_with_retry(
@@ -504,12 +553,110 @@ with tab_curate:
     with col_pdf:
         paper_pdf = st.file_uploader("Main paper PDF", type=["pdf"], key="paper_pdf")
     with col_supp:
-        supp_files = st.file_uploader(
-            "Supplementary files",
-            type=["xlsx", "xls", "csv", "tsv", "txt", "tab", "maf", "doc", "docx", "pdf"],
-            accept_multiple_files=True,
-            key="supp_files",
+        supp_source = st.radio(
+            "Supplementary source",
+            options=["Upload files", "PubMed Central"],
+            horizontal=True,
+            key="supp_source",
         )
+        supp_files = []
+        pmc_identifier = ""
+        pmc_identifier_type = None
+        if supp_source == "Upload files":
+            if st.session_state.get("pmc_downloaded_files"):
+                _clear_pmc_download_state()
+            supp_files = st.file_uploader(
+                "Supplementary files",
+                type=["xlsx", "xls", "csv", "tsv", "txt", "tab", "maf", "doc", "docx", "pdf"],
+                accept_multiple_files=True,
+                key="supp_files",
+            )
+        else:
+            pmc_identifier = st.text_input(
+                "PMID or PMCID",
+                placeholder="34493867 or PMC8432745",
+                key="pmc_identifier",
+            ).strip()
+            pmc_identifier_type = _detect_pubmed_identifier_type(pmc_identifier)
+            if pmc_identifier and pmc_identifier_type:
+                st.caption(f"Detected {pmc_identifier_type}.")
+            elif pmc_identifier:
+                st.warning("Enter a numeric PMID or a PMCID such as PMC8432745.")
+
+            current_download_matches = (
+                st.session_state.get("pmc_download_identifier") == pmc_identifier
+                and st.session_state.get("pmc_download_identifier_type") == pmc_identifier_type
+            )
+            if pmc_identifier and not current_download_matches:
+                _clear_pmc_download_state()
+
+            if st.button(
+                "Download supplementary files",
+                disabled=not pmc_identifier_type,
+                key="download_pmc_supp_files",
+            ):
+                from pmc_supplement_fetcher import download_pmc_supplements
+
+                _clear_pmc_download_state()
+                pmc_tmp_dir = tempfile.mkdtemp()
+                try:
+                    with st.spinner("Downloading supplementary files from PubMed Central..."):
+                        pmcid, downloaded = download_pmc_supplements(
+                            identifier=pmc_identifier,
+                            identifier_type=pmc_identifier_type,
+                            output_dir=pmc_tmp_dir,
+                        )
+                    st.session_state["pmc_download_tmp_dir"] = pmc_tmp_dir
+                    st.session_state["pmc_download_pmcid"] = pmcid
+                    st.session_state["pmc_download_identifier"] = pmc_identifier
+                    st.session_state["pmc_download_identifier_type"] = pmc_identifier_type
+                    st.session_state["pmc_downloaded_files"] = [
+                        {
+                            "path": item.path,
+                            "filename": item.filename,
+                            "source_url": item.source_url,
+                        }
+                        for item in downloaded
+                    ]
+                    st.success(f"Downloaded {len(downloaded)} supplementary file(s) from {pmcid}.")
+                except Exception as exc:
+                    shutil.rmtree(pmc_tmp_dir, ignore_errors=True)
+                    print(f"Supplementary download failed: {exc}", file=sys.stderr)
+                    traceback.print_exc()
+                    st.error(
+                        "Impossible to retrieve supplementary files for this identifier. "
+                        "Please check that the PMID or PMCID is correct."
+                    )
+
+            downloaded_files = st.session_state.get("pmc_downloaded_files") or []
+            if downloaded_files:
+                st.success(
+                    f"Ready: {len(downloaded_files)} file(s) from "
+                    f"{st.session_state.get('pmc_download_pmcid', 'PMC')}."
+                )
+                for idx, item in enumerate(downloaded_files):
+                    cols = st.columns([0.08, 0.52, 0.40])
+                    if cols[0].button("X", key=f"remove_pmc_file_{idx}", help="Remove this file"):
+                        try:
+                            os.remove(item["path"])
+                        except OSError:
+                            pass
+                        st.session_state["pmc_downloaded_files"] = [
+                            row for row_idx, row in enumerate(downloaded_files) if row_idx != idx
+                        ]
+                        st.rerun()
+                    cols[1].write(item["filename"])
+                    cols[2].caption(item["source_url"])
+
+                zip_bytes = _build_download_zip(downloaded_files)
+                if zip_bytes:
+                    st.download_button(
+                        "Download selected supplementary files (.zip)",
+                        data=zip_bytes,
+                        file_name=f"{st.session_state.get('pmc_download_pmcid', 'pmc')}_supplementary_files.zip",
+                        mime="application/zip",
+                        key="download_pmc_supp_zip",
+                    )
 
     if supp_files:
         st.markdown("#### Confirm uploaded filenames")
@@ -547,20 +694,23 @@ with tab_curate:
         try:
             with st.spinner("Saving uploaded files..."):
                 pdf_tmp = _save_upload_to_tmp(paper_pdf)
-                for idx, uploaded in enumerate(supp_files or []):
-                    filename = st.session_state.get(f"fname_{idx}") or uploaded.name
-                    supp_tmps.append(_save_upload_to_tmp(uploaded, filename=filename))
+                if supp_source == "Upload files":
+                    for idx, uploaded in enumerate(supp_files or []):
+                        filename = st.session_state.get(f"fname_{idx}") or uploaded.name
+                        supp_tmps.append(_save_upload_to_tmp(uploaded, filename=filename))
+                else:
+                    downloaded_files = st.session_state.get("pmc_downloaded_files") or []
+                    supp_tmps.extend(item["path"] for item in downloaded_files)
 
             with st.spinner("Step 1 of 2 — Extracting study metadata from PDF..."):
-                import anthropic
                 from cbioportal_curator import SYSTEM_PROMPT_CURATOR, _extract_pdf_text
 
                 pdf_text = _extract_pdf_text(pdf_tmp)
                 meta: dict[str, Any] = {}
                 if pdf_text.strip():
-                    client = anthropic.Anthropic(api_key=_get_api_key())
-                    raw_meta = _call_anthropic_with_retry(
-                        client=client,
+                    raw_meta = _call_llm_with_retry(
+                        provider=provider,
+                        api_key=_get_api_key(provider),
                         model=model,
                         system=SYSTEM_PROMPT_CURATOR,
                         user_content=pdf_text[:40000],
@@ -612,7 +762,10 @@ with tab_curate:
                 st.code(traceback.format_exc())
             st.stop()
         finally:
-            _safe_cleanup(pdf_tmp or "", *supp_tmps)
+            if supp_source == "Upload files":
+                _safe_cleanup(pdf_tmp or "", *supp_tmps)
+            else:
+                _safe_cleanup(pdf_tmp or "")
 
         st.success("Curation complete.")
         st.divider()
