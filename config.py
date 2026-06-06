@@ -6,9 +6,9 @@ All tunable constants live here.
 
 Notes
 -----
-The Anthropic API key is read directly from the ANTHROPIC_API_KEY environment
-variable (or Streamlit secret / sidebar input) inside streamlit_app.py, so it
-deliberately is not re-exported here.
+API keys are read directly from ANTHROPIC_API_KEY or OPENAI_API_KEY environment
+variables (or Streamlit secrets / sidebar input) inside streamlit_app.py, so
+they deliberately are not re-exported here.
 """
 import os
 

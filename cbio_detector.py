@@ -32,7 +32,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from config import FEW_SHOT_DIR, DETECTION_SAMPLE_ROWS, CBIO_FORMAT_IDS
+from config import FEW_SHOT_DIR, DETECTION_SAMPLE_ROWS
 
 logger = logging.getLogger(__name__)
 
@@ -238,14 +238,7 @@ def _heuristic_detect(df: pd.DataFrame) -> Tuple[Optional[str], float]:
 # LLM-powered detector (few-shot)
 # ---------------------------------------------------------------------------
 
-def _llm_detect(df: pd.DataFrame, examples: List[dict], api_key: str) -> Tuple[str, float, str]:
-    """
-    Use Claude to detect the file type with few-shot examples injected.
-    Returns (detected_type, confidence, reasoning).
-    """
-    import anthropic
-
-    # Build few-shot block
+def _build_detection_prompt(df: pd.DataFrame, examples: List[dict]) -> str:
     few_shot_block = ""
     for i, ex in enumerate(examples[:6]):  # max 6 examples to keep prompt manageable
         few_shot_block += f"""
@@ -262,7 +255,7 @@ Output format preview:
     col_list = list(df.columns)
     sample_rows = df.head(DETECTION_SAMPLE_ROWS).to_csv(sep="\t", index=False)
 
-    prompt = f"""You are a bioinformatics data curation expert specializing in cBioPortal data formats.
+    return f"""You are a bioinformatics data curation expert specializing in cBioPortal data formats.
 
 Your task: identify which cBioPortal file type this supplemental data file represents.
 
@@ -295,6 +288,24 @@ Respond with ONLY a JSON object in this exact format (no markdown, no extra text
 }}
 """
 
+
+def _parse_detection_response(raw: str) -> Tuple[str, float, str, dict]:
+    raw = raw.strip()
+    raw = re.sub(r"^```[^\n]*\n?", "", raw, flags=re.MULTILINE)
+    raw = re.sub(r"```$", "", raw, flags=re.MULTILINE).strip()
+
+    result = json.loads(raw)
+    return result["type"], float(result["confidence"]), result.get("reasoning", ""), result.get("column_mappings", {})
+
+
+def _llm_detect(df: pd.DataFrame, examples: List[dict], api_key: str) -> Tuple[str, float, str, dict]:
+    """
+    Use Claude to detect the file type with few-shot examples injected.
+    Returns (detected_type, confidence, reasoning, column_mappings).
+    """
+    import anthropic
+
+    prompt = _build_detection_prompt(df, examples)
     client = anthropic.Anthropic(api_key=api_key)
     response = client.messages.create(
         model="claude-sonnet-4-20250514",
@@ -302,13 +313,30 @@ Respond with ONLY a JSON object in this exact format (no markdown, no extra text
         messages=[{"role": "user", "content": prompt}],
     )
 
-    raw = response.content[0].text.strip()
-    # Strip accidental markdown fences
-    raw = re.sub(r"^```[^\n]*\n?", "", raw, flags=re.MULTILINE)
-    raw = re.sub(r"```$", "", raw, flags=re.MULTILINE).strip()
+    return _parse_detection_response(response.content[0].text)
 
-    result = json.loads(raw)
-    return result["type"], float(result["confidence"]), result.get("reasoning", ""), result.get("column_mappings", {})
+
+def _openai_detect(
+    df: pd.DataFrame,
+    examples: List[dict],
+    api_key: str,
+    model: str = "gpt-5.5",
+) -> Tuple[str, float, str, dict]:
+    """
+    Use OpenAI to detect the file type with few-shot examples injected.
+    Returns (detected_type, confidence, reasoning, column_mappings).
+    """
+    from openai import OpenAI
+
+    prompt = _build_detection_prompt(df, examples)
+    client = OpenAI(api_key=api_key)
+    response = client.chat.completions.create(
+        model=model,
+        max_completion_tokens=800,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    return _parse_detection_response(response.choices[0].message.content or "")
 
 
 # ---------------------------------------------------------------------------
@@ -319,6 +347,7 @@ def detect_file_type(
     df: pd.DataFrame,
     anthropic_api_key: Optional[str] = None,
     openai_api_key: Optional[str] = None,
+    openai_model: str = "gpt-5.5",
 ) -> dict:
     """
     Detect the cBioPortal format of a DataFrame.
@@ -365,6 +394,27 @@ def detect_file_type(
             }
         except Exception as e:
             logger.error(f"LLM detection failed: {e}")
+
+    if openai_api_key:
+        try:
+            examples = load_few_shot_examples()
+            llm_type, llm_conf, reasoning, mappings = _openai_detect(
+                df,
+                examples,
+                openai_api_key,
+                model=openai_model,
+            )
+            logger.info(f"OpenAI detection: type={llm_type}, confidence={llm_conf:.2f}")
+            return {
+                "type": llm_type,
+                "confidence": llm_conf,
+                "method": "openai_few_shot",
+                "reasoning": reasoning,
+                "column_mappings": mappings,
+                "low_confidence": llm_conf < DETECTION_CONFIDENCE_THRESHOLD,
+            }
+        except Exception as e:
+            logger.error(f"OpenAI detection failed: {e}")
 
     # 3. Fallback: return best heuristic guess with low confidence flag
     return {

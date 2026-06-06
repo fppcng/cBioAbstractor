@@ -74,11 +74,15 @@ pip install -r requirements.txt
 
 ## API Key Setup
 
-Set your Anthropic API key locally as an environment variable:
+Set either an Anthropic or OpenAI API key locally as an environment variable:
 
 ```bash
 export ANTHROPIC_API_KEY="your-api-key"
+# or
+export OPENAI_API_KEY="your-api-key"
 ```
+
+The Streamlit sidebar lets you choose between Anthropic and OpenAI models.
 
 Do not commit API keys to GitHub.
 
@@ -167,4 +171,3 @@ These examples help the app recognize recurring supplemental file patterns.
 - Supplementary file classification
 - cBioPortal format assessment
 - Curation report generation
-

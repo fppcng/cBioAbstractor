@@ -42,19 +42,54 @@ st.set_page_config(
 # ─────────────────────────────────────────────────────────────────────────────
 # API key loading
 # Resolution order:
-#   1. ANTHROPIC_API_KEY environment variable
+#   1. Provider-specific environment variable
 #   2. Streamlit secrets
 #   3. Sidebar input
 # ─────────────────────────────────────────────────────────────────────────────
-def _load_api_key() -> str:
-    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+PROVIDER_CONFIG = {
+    "Anthropic": {
+        "env": "ANTHROPIC_API_KEY",
+        "placeholder": "sk-ant-...",
+        "models": [
+            "claude-sonnet-4-20250514",
+            "claude-3-5-haiku-20241022",
+            "claude-3-5-sonnet-20241022",
+            "claude-sonnet-4-6",
+            "claude-opus-4-6",
+            "claude-haiku-4-5-20251001",
+        ],
+    },
+    "OpenAI": {
+        "env": "OPENAI_API_KEY",
+        "placeholder": "sk-...",
+        "models": [
+            "gpt-5.5",
+            "gpt-5.5-pro",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.4-nano",
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5-nano",
+            "gpt-4o",
+            "gpt-4o-mini",
+            "gpt-4.1",
+            "gpt-4.1-mini",
+        ],
+    },
+}
+
+
+def _load_api_key(provider: str) -> str:
+    env_name = PROVIDER_CONFIG[provider]["env"]
+    key = os.environ.get(env_name, "").strip()
     if key:
         return key
 
     try:
-        key = st.secrets.get("ANTHROPIC_API_KEY", "").strip()
+        key = st.secrets.get(env_name, "").strip()
         if key:
-            os.environ["ANTHROPIC_API_KEY"] = key
+            os.environ[env_name] = key
             return key
     except Exception:
         pass
@@ -62,16 +97,32 @@ def _load_api_key() -> str:
     return ""
 
 
-_API_KEY = _load_api_key()
+_API_KEYS = {provider: _load_api_key(provider) for provider in PROVIDER_CONFIG}
 
 
-def _get_api_key() -> str:
-    return (_API_KEY or os.environ.get("ANTHROPIC_API_KEY", "")).strip()
+def _default_provider_index() -> int:
+    providers = list(PROVIDER_CONFIG.keys())
+    if _API_KEYS.get("OpenAI") and not _API_KEYS.get("Anthropic"):
+        return providers.index("OpenAI")
+    return providers.index("Anthropic")
 
 
-def _require_api_key() -> bool:
-    if not _get_api_key():
-        st.error("Please add your Anthropic API key in the sidebar or set ANTHROPIC_API_KEY.")
+def _get_api_key(provider: str) -> str:
+    env_name = PROVIDER_CONFIG[provider]["env"]
+    return (_API_KEYS.get(provider) or os.environ.get(env_name, "")).strip()
+
+
+def _set_api_key(provider: str, key: str) -> None:
+    env_name = PROVIDER_CONFIG[provider]["env"]
+    clean_key = key.strip()
+    os.environ[env_name] = clean_key
+    _API_KEYS[provider] = clean_key
+
+
+def _require_api_key(provider: str) -> bool:
+    if not _get_api_key(provider):
+        env_name = PROVIDER_CONFIG[provider]["env"]
+        st.error(f"Please add your {provider} API key in the sidebar or set {env_name}.")
         return False
     return True
 
@@ -133,6 +184,80 @@ def _call_anthropic_with_retry(
             time.sleep(backoff * (attempt + 1))
 
     raise last_error or RuntimeError("Anthropic API call failed after retries.")
+
+
+def _call_openai_with_retry(
+    client,
+    model: str,
+    system: str,
+    user_content: str,
+    max_tokens: int = 2000,
+    retries: int = 3,
+    backoff: float = 5.0,
+) -> str:
+    import openai
+
+    last_error: Exception | None = None
+    for attempt in range(retries):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                max_completion_tokens=max_tokens,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_content},
+                ],
+            )
+            return response.choices[0].message.content or ""
+        except openai.RateLimitError as exc:
+            last_error = exc
+            time.sleep(backoff * (attempt + 1))
+        except openai.APIStatusError as exc:
+            if exc.status_code >= 500:
+                last_error = exc
+                time.sleep(backoff * (attempt + 1))
+            else:
+                raise
+        except openai.APIConnectionError as exc:
+            last_error = exc
+            time.sleep(backoff * (attempt + 1))
+
+    raise last_error or RuntimeError("OpenAI API call failed after retries.")
+
+
+def _call_llm_with_retry(
+    provider: str,
+    api_key: str,
+    model: str,
+    system: str,
+    user_content: str,
+    max_tokens: int = 2000,
+) -> str:
+    if provider == "Anthropic":
+        import anthropic
+
+        client = anthropic.Anthropic(api_key=api_key)
+        return _call_anthropic_with_retry(
+            client=client,
+            model=model,
+            system=system,
+            user_content=user_content,
+            max_tokens=max_tokens,
+        )
+
+    if provider == "OpenAI":
+        from openai import OpenAI
+
+        client = OpenAI(api_key=api_key)
+        return _call_openai_with_retry(
+            client=client,
+            model=model,
+            system=system,
+            user_content=user_content,
+            max_tokens=max_tokens,
+        )
+
+    raise ValueError(f"Unsupported LLM provider: {provider}")
 
 
 def _parse_llm_json(raw: str) -> dict[str, Any]:
@@ -313,21 +438,28 @@ with st.sidebar:
     st.caption("Automated curation support for cancer genomics studies.")
     st.divider()
 
+    provider = st.selectbox(
+        "AI provider",
+        options=list(PROVIDER_CONFIG.keys()),
+        index=_default_provider_index(),
+        key="llm_provider",
+    )
+    provider_env = PROVIDER_CONFIG[provider]["env"]
+
     entered_key = st.text_input(
-        "Anthropic API key",
+        f"{provider} API key",
         type="password",
-        value="" if _get_api_key() else "",
-        placeholder="sk-ant-...",
-        help="For local use, you can also set ANTHROPIC_API_KEY in your shell.",
+        value="" if _get_api_key(provider) else "",
+        placeholder=PROVIDER_CONFIG[provider]["placeholder"],
+        help=f"For local use, you can also set {provider_env} in your shell or .env file.",
     )
     if entered_key:
-        os.environ["ANTHROPIC_API_KEY"] = entered_key.strip()
-        _API_KEY = entered_key.strip()
+        _set_api_key(provider, entered_key)
 
-    if _get_api_key():
-        st.success("Connected")
+    if _get_api_key(provider):
+        st.success(f"{provider} connected")
     else:
-        st.warning("API key not configured")
+        st.warning(f"{provider} API key not configured")
 
     st.divider()
     st.caption("Version 1.2 — Streamlit only")
@@ -391,20 +523,22 @@ with tab_curate:
 
     with st.expander("Options"):
         model = st.selectbox(
-            "Anthropic model",
-            options=[
-                "claude-sonnet-4-20250514",
-                "claude-3-5-haiku-20241022",
-                "claude-3-5-sonnet-20241022",
-                "claude-sonnet-4-6",            # latest Sonnet — recommended default
-                "claude-opus-4-6",              # most capable, slower/more expensive
-                "claude-haiku-4-5-20251001",    # fastest/cheapest
-            ],
+            f"{provider} model",
+            options=PROVIDER_CONFIG[provider]["models"],
             index=0,
         )
 
-    if st.button("Generate Curation Report", disabled=paper_pdf is None, type="primary"):
-        if not _require_api_key():
+    missing_supp_source = (
+        (supp_source == "Upload files" and not supp_files)
+        or (supp_source == "PubMed Central" and not st.session_state.get("pmc_downloaded_files"))
+    )
+
+    if st.button(
+        "Generate Curation Report",
+        disabled=paper_pdf is None or missing_supp_source,
+        type="primary",
+    ):
+        if not _require_api_key(provider):
             st.stop()
 
         pdf_tmp: str | None = None
@@ -519,10 +653,15 @@ with tab_detect:
         st.markdown("#### File Preview")
         st.dataframe(df.head(10), use_container_width=True)
 
-        api_key = _get_api_key() if use_ai else None
+        api_key = _get_api_key(provider) if use_ai else None
         with st.spinner("Classifying file..."):
             try:
-                result = detect_file_type(df, anthropic_api_key=api_key)
+                result = detect_file_type(
+                    df,
+                    anthropic_api_key=api_key if provider == "Anthropic" else None,
+                    openai_api_key=api_key if provider == "OpenAI" else None,
+                    openai_model=model,
+                )
             except Exception as exc:
                 st.error(f"Classification failed: {exc}")
                 st.stop()
