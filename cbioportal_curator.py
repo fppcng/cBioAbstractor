@@ -39,6 +39,9 @@ from docx.oxml import OxmlElement
 
 from spec_match import classify_sheet, ClassificationResult
 from cbioportal_spec import SPEC_BY_KEY
+from xml_metadata import extract_metadata_from_xml as _extract_metadata_from_xml
+from xml_metadata import extract_xml_llm_text
+from xml_metadata import extract_xml_text
 
 # ─────────────────────────────────────────────────────────────
 # Constants
@@ -635,6 +638,11 @@ def _extract_metadata_regex(pdf_text: str) -> dict:
         "data_repositories":    repos[:4],
         "corresponding_authors": corresp,
     }
+
+
+def extract_metadata_from_xml(xml_source: str | bytes | Path) -> dict:
+    return _extract_metadata_from_xml(xml_source)
+
 
 def _extract_metadata_llm(pdf_text: str, model: str, temperature: float) -> dict:
     import json, logging

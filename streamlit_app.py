@@ -13,20 +13,22 @@ or Streamlit secret.
 
 from __future__ import annotations
 
-import json
 import io
 import os
 import re
 import shutil
 import sys
 import tempfile
-import time
 import traceback
 import zipfile
 from typing import Any
 
 import pandas as pd
 import streamlit as st
+
+from llm_client import call_llm_with_retry as _call_llm_with_retry
+from llm_client import parse_llm_json as _parse_llm_json
+from metadata_merge import merge_missing_metadata_fields
 
 # ── Path setup ────────────────────────────────────────────────────────────────
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -66,6 +68,7 @@ PROVIDER_CONFIG = {
         "env": "OPENAI_API_KEY",
         "placeholder": "sk-...",
         "models": [
+            "gpt-4o",
             "gpt-5.5",
             "gpt-5.5-pro",
             "gpt-5.4",
@@ -74,7 +77,6 @@ PROVIDER_CONFIG = {
             "gpt-5",
             "gpt-5-mini",
             "gpt-5-nano",
-            "gpt-4o",
             "gpt-4o-mini",
             "gpt-4.1",
             "gpt-4.1-mini",
@@ -196,124 +198,6 @@ def _detect_pubmed_identifier_type(identifier: str) -> str | None:
     if re.fullmatch(r"\d+", value):
         return "PMID"
     return None
-
-
-def _call_anthropic_with_retry(
-    client,
-    model: str,
-    system: str,
-    user_content: str,
-    max_tokens: int = 2000,
-    retries: int = 3,
-    backoff: float = 5.0,
-) -> str:
-    import anthropic
-
-    last_error: Exception | None = None
-    for attempt in range(retries):
-        try:
-            response = client.messages.create(
-                model=model,
-                max_tokens=max_tokens,
-                system=system,
-                messages=[{"role": "user", "content": user_content}],
-            )
-            return response.content[0].text
-        except anthropic.RateLimitError as exc:
-            last_error = exc
-            time.sleep(backoff * (attempt + 1))
-        except anthropic.APIStatusError as exc:
-            if exc.status_code >= 500:
-                last_error = exc
-                time.sleep(backoff * (attempt + 1))
-            else:
-                raise
-        except anthropic.APIConnectionError as exc:
-            last_error = exc
-            time.sleep(backoff * (attempt + 1))
-
-    raise last_error or RuntimeError("Anthropic API call failed after retries.")
-
-
-def _call_openai_with_retry(
-    client,
-    model: str,
-    system: str,
-    user_content: str,
-    max_tokens: int = 2000,
-    retries: int = 3,
-    backoff: float = 5.0,
-) -> str:
-    import openai
-
-    last_error: Exception | None = None
-    for attempt in range(retries):
-        try:
-            response = client.chat.completions.create(
-                model=model,
-                max_completion_tokens=max_tokens,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user_content},
-                ],
-            )
-            return response.choices[0].message.content or ""
-        except openai.RateLimitError as exc:
-            last_error = exc
-            time.sleep(backoff * (attempt + 1))
-        except openai.APIStatusError as exc:
-            if exc.status_code >= 500:
-                last_error = exc
-                time.sleep(backoff * (attempt + 1))
-            else:
-                raise
-        except openai.APIConnectionError as exc:
-            last_error = exc
-            time.sleep(backoff * (attempt + 1))
-
-    raise last_error or RuntimeError("OpenAI API call failed after retries.")
-
-
-def _call_llm_with_retry(
-    provider: str,
-    api_key: str,
-    model: str,
-    system: str,
-    user_content: str,
-    max_tokens: int = 2000,
-) -> str:
-    if provider == "Anthropic":
-        import anthropic
-
-        client = anthropic.Anthropic(api_key=api_key)
-        return _call_anthropic_with_retry(
-            client=client,
-            model=model,
-            system=system,
-            user_content=user_content,
-            max_tokens=max_tokens,
-        )
-
-    if provider == "OpenAI":
-        from openai import OpenAI
-
-        client = OpenAI(api_key=api_key)
-        return _call_openai_with_retry(
-            client=client,
-            model=model,
-            system=system,
-            user_content=user_content,
-            max_tokens=max_tokens,
-        )
-
-    raise ValueError(f"Unsupported LLM provider: {provider}")
-
-
-def _parse_llm_json(raw: str) -> dict[str, Any]:
-    cleaned = raw.strip()
-    cleaned = re.sub(r"^```[^\n]*\n?", "", cleaned, flags=re.MULTILINE)
-    cleaned = re.sub(r"```$", "", cleaned, flags=re.MULTILINE).strip()
-    return json.loads(cleaned)
 
 
 def _looks_tmp(name: str) -> bool:
@@ -533,8 +417,8 @@ tab_curate, tab_detect = st.tabs(["Curation Report", "File Classification"])
 with tab_curate:
     st.subheader("Curation Report Generator")
     st.markdown(
-        "Upload the main paper PDF and supplementary files. The tool extracts "
-        "study metadata and classifies each file against cBioPortal formats."
+        "Upload a paper PDF with local supplementary files, or enter a PMID/PMCID "
+        "to retrieve metadata and supplementary files from PubMed Central."
     )
 
     try:
@@ -549,29 +433,33 @@ with tab_curate:
         st.caption("Using embedded cBioPortal format specifications.")
 
     st.divider()
-    col_pdf, col_supp = st.columns(2)
-    with col_pdf:
-        paper_pdf = st.file_uploader("Main paper PDF", type=["pdf"], key="paper_pdf")
-    with col_supp:
-        supp_source = st.radio(
-            "Supplementary source",
-            options=["Upload files", "PubMed Central"],
-            horizontal=True,
-            key="supp_source",
-        )
-        supp_files = []
-        pmc_identifier = ""
-        pmc_identifier_type = None
-        if supp_source == "Upload files":
-            if st.session_state.get("pmc_downloaded_files"):
-                _clear_pmc_download_state()
+    supp_source = st.radio(
+        "Supplementary source",
+        options=["Upload files", "PubMed Central"],
+        horizontal=True,
+        key="supp_source",
+    )
+
+    paper_pdf = None
+    supp_files = []
+    pmc_identifier = ""
+    pmc_identifier_type = None
+
+    if supp_source == "Upload files":
+        if st.session_state.get("pmc_downloaded_files"):
+            _clear_pmc_download_state()
+        col_pdf, col_supp = st.columns(2)
+        with col_pdf:
+            paper_pdf = st.file_uploader("Main paper PDF", type=["pdf"], key="paper_pdf")
+        with col_supp:
             supp_files = st.file_uploader(
                 "Supplementary files",
                 type=["xlsx", "xls", "csv", "tsv", "txt", "tab", "maf", "doc", "docx", "pdf"],
                 accept_multiple_files=True,
                 key="supp_files",
             )
-        else:
+    else:
+        with st.container():
             pmc_identifier = st.text_input(
                 "PMID or PMCID",
                 placeholder="34493867 or PMC8432745",
@@ -591,7 +479,7 @@ with tab_curate:
                 _clear_pmc_download_state()
 
             if st.button(
-                "Download supplementary files",
+                "Download supplementary files and study full text",
                 disabled=not pmc_identifier_type,
                 key="download_pmc_supp_files",
             ):
@@ -628,35 +516,35 @@ with tab_curate:
                         "Please check that the PMID or PMCID is correct."
                     )
 
-            downloaded_files = st.session_state.get("pmc_downloaded_files") or []
-            if downloaded_files:
-                st.success(
-                    f"Ready: {len(downloaded_files)} file(s) from "
-                    f"{st.session_state.get('pmc_download_pmcid', 'PMC')}."
-                )
-                for idx, item in enumerate(downloaded_files):
-                    cols = st.columns([0.08, 0.52, 0.40])
-                    if cols[0].button("X", key=f"remove_pmc_file_{idx}", help="Remove this file"):
-                        try:
-                            os.remove(item["path"])
-                        except OSError:
-                            pass
-                        st.session_state["pmc_downloaded_files"] = [
-                            row for row_idx, row in enumerate(downloaded_files) if row_idx != idx
-                        ]
-                        st.rerun()
-                    cols[1].write(item["filename"])
-                    cols[2].caption(item["source_url"])
+        downloaded_files = st.session_state.get("pmc_downloaded_files") or []
+        if downloaded_files:
+            st.success(
+                f"Ready: {len(downloaded_files)} file(s) from "
+                f"{st.session_state.get('pmc_download_pmcid', 'PMC')}."
+            )
+            for idx, item in enumerate(downloaded_files):
+                cols = st.columns([0.08, 0.52, 0.40])
+                if cols[0].button("X", key=f"remove_pmc_file_{idx}", help="Remove this file"):
+                    try:
+                        os.remove(item["path"])
+                    except OSError:
+                        pass
+                    st.session_state["pmc_downloaded_files"] = [
+                        row for row_idx, row in enumerate(downloaded_files) if row_idx != idx
+                    ]
+                    st.rerun()
+                cols[1].write(item["filename"])
+                cols[2].caption(item["source_url"])
 
-                zip_bytes = _build_download_zip(downloaded_files)
-                if zip_bytes:
-                    st.download_button(
-                        "Download selected supplementary files (.zip)",
-                        data=zip_bytes,
-                        file_name=f"{st.session_state.get('pmc_download_pmcid', 'pmc')}_supplementary_files.zip",
-                        mime="application/zip",
-                        key="download_pmc_supp_zip",
-                    )
+            zip_bytes = _build_download_zip(downloaded_files)
+            if zip_bytes:
+                st.download_button(
+                    "Download selected supplementary files (.zip)",
+                    data=zip_bytes,
+                    file_name=f"{st.session_state.get('pmc_download_pmcid', 'pmc')}_supplementary_files.zip",
+                    mime="application/zip",
+                    key="download_pmc_supp_zip",
+                )
 
     if supp_files:
         st.markdown("#### Confirm uploaded filenames")
@@ -679,10 +567,11 @@ with tab_curate:
         (supp_source == "Upload files" and not supp_files)
         or (supp_source == "PubMed Central" and not st.session_state.get("pmc_downloaded_files"))
     )
+    missing_paper_source = supp_source == "Upload files" and paper_pdf is None
 
     if st.button(
         "Generate Curation Report",
-        disabled=paper_pdf is None or missing_supp_source,
+        disabled=missing_paper_source or missing_supp_source,
         type="primary",
     ):
         if not _require_api_key(provider):
@@ -693,8 +582,8 @@ with tab_curate:
 
         try:
             with st.spinner("Saving uploaded files..."):
-                pdf_tmp = _save_upload_to_tmp(paper_pdf)
                 if supp_source == "Upload files":
+                    pdf_tmp = _save_upload_to_tmp(paper_pdf)
                     for idx, uploaded in enumerate(supp_files or []):
                         filename = st.session_state.get(f"fname_{idx}") or uploaded.name
                         supp_tmps.append(_save_upload_to_tmp(uploaded, filename=filename))
@@ -702,27 +591,62 @@ with tab_curate:
                     downloaded_files = st.session_state.get("pmc_downloaded_files") or []
                     supp_tmps.extend(item["path"] for item in downloaded_files)
 
-            with st.spinner("Step 1 of 2 — Extracting study metadata from PDF..."):
-                from cbioportal_curator import SYSTEM_PROMPT_CURATOR, _extract_pdf_text
-
-                pdf_text = _extract_pdf_text(pdf_tmp)
-                meta: dict[str, Any] = {}
-                if pdf_text.strip():
-                    raw_meta = _call_llm_with_retry(
-                        provider=provider,
-                        api_key=_get_api_key(provider),
-                        model=model,
-                        system=SYSTEM_PROMPT_CURATOR,
-                        user_content=pdf_text[:40000],
-                        max_tokens=2000,
+            meta: dict[str, Any] = {}
+            if supp_source == "PubMed Central":
+                with st.spinner("Step 1 of 2 — Extracting study metadata from PMC XML..."):
+                    from cbioportal_curator import (
+                        SYSTEM_PROMPT_CURATOR,
+                        extract_metadata_from_xml,
+                        extract_xml_llm_text,
                     )
-                    try:
-                        meta = _parse_llm_json(raw_meta)
-                    except Exception:
-                        st.warning("Metadata extraction returned unexpected format. Continuing with file classification.")
-                        meta = {}
-                else:
-                    st.warning("Could not extract text from the PDF. Metadata fields will be blank.")
+                    from pmc_supplement_fetcher import _fetch_pmc_xml
+
+                    pmcid = st.session_state.get("pmc_download_pmcid")
+                    if not pmcid:
+                        raise RuntimeError("Missing PMCID for PMC metadata extraction.")
+
+                    xml_text = _fetch_pmc_xml(pmcid)
+                    meta = extract_metadata_from_xml(xml_text)
+                    llm_text = extract_xml_llm_text(xml_text)
+                    if llm_text.strip():
+                        try:
+                            raw_meta = _call_llm_with_retry(
+                                provider=provider,
+                                api_key=_get_api_key(provider),
+                                model=model,
+                                system=SYSTEM_PROMPT_CURATOR,
+                                user_content=llm_text[:40000],
+                                max_tokens=2000,
+                            )
+                            meta = merge_missing_metadata_fields(meta, _parse_llm_json(raw_meta))
+                        except Exception:
+                            st.warning(
+                                "XML metadata completion returned unexpected format. "
+                                "Continuing with structured XML metadata only."
+                            )
+                    else:
+                        st.warning("Could not extract text from the PMC XML. Using structured XML metadata only.")
+            else:
+                with st.spinner("Step 1 of 2 — Extracting study metadata from PDF..."):
+                    from cbioportal_curator import SYSTEM_PROMPT_CURATOR, _extract_pdf_text
+
+                    pdf_text = _extract_pdf_text(pdf_tmp)
+                    if pdf_text.strip():
+                        raw_meta = _call_llm_with_retry(
+                            provider=provider,
+                            api_key=_get_api_key(provider),
+                            model=model,
+                            system=SYSTEM_PROMPT_CURATOR,
+                            user_content=pdf_text[:40000],
+                            max_tokens=2000,
+                        )
+                        try:
+                            meta = _parse_llm_json(raw_meta)
+                        except Exception:
+                            st.warning("Metadata extraction returned unexpected format. Continuing with file classification.")
+                            meta = {}
+                    else:
+                        st.warning("Could not extract text from the PDF. Metadata fields will be blank.")
 
             with st.spinner(f"Step 2 of 2 — Classifying {len(supp_tmps)} supplementary file(s)..."):
                 from cbioportal_curator import _analyse_supplementary_files
