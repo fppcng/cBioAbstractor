@@ -339,8 +339,11 @@ def _download_url(url: str, output_dir: Path, index: int) -> Path:
 
 
 def _safe_extract_path(base_dir: Path, member_name: str) -> Path:
+    base_dir = base_dir.resolve()
     target = (base_dir / member_name).resolve()
-    if not str(target).startswith(str(base_dir.resolve())):
+    try:
+        target.relative_to(base_dir)
+    except ValueError:
         raise ValueError(f"Archive member escapes extraction directory: {member_name}")
     return target
 
